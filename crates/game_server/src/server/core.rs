@@ -564,25 +564,18 @@ impl GameServer {
                 if let (Ok(old_player_id), Ok(new_player_id)) = (old_player_id, new_player_id) {
                     // Spawn a dedicated thread with its own runtime to handle the async work
                     // This is necessary because on_core_async handlers don't have a guaranteed tokio runtime context
-                    std::thread::spawn(move || {
-                        let rt = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .expect("Failed to build runtime for update_player_id");
-
-                        rt.block_on(async move {
-                            // Get the connection_id for this player
-                            if let Some(connection_id) = conn_mgr.get_connection_id_by_player(old_player_id).await {
-                                // Update the player_id stored in the connection
-                                conn_mgr.set_player_id(connection_id, new_player_id).await;
-                                info!(
-                                    "🔄 Updated player_id in connection {} from {} to {}",
-                                    connection_id, old_player_id, new_player_id
-                                );
-                            } else {
-                                warn!("⚠️ Failed to find connection for player {} when updating player_id", old_player_id);
-                            }
-                        });
+                    tokio::spawn(async move {
+                        // Get the connection_id for this player
+                        if let Some(connection_id) = conn_mgr.get_connection_id_by_player(old_player_id).await {
+                            // Update the player_id stored in the connection
+                            conn_mgr.set_player_id(connection_id, new_player_id).await;
+                            info!(
+                                "🔄 Updated player_id in connection {} from {} to {}",
+                                connection_id, old_player_id, new_player_id
+                            );
+                        } else {
+                            warn!("⚠️ Failed to find connection for player {} when updating player_id", old_player_id);
+                        }
                     });
                 } else {
                     warn!("⚠️ Failed to deserialize player IDs from update_player_id event: {:?}", event);

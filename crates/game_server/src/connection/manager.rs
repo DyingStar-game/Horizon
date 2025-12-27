@@ -3,6 +3,8 @@
 //! This module provides the central management system for all client connections,
 //! handling connection lifecycle, player ID assignment, and message broadcasting.
 
+const MESSAGE_CHANNEL_CAPACITY: usize = 1000;
+
 use super::{client::ClientConnection, ConnectionId};
 use horizon_event_system::{PlayerId, AuthenticationStatus};
 use std::collections::HashMap;
@@ -37,7 +39,7 @@ pub struct ConnectionManager {
     next_id: Arc<std::sync::atomic::AtomicUsize>,
     
     /// Per-connection message senders for O(1) message delivery
-    message_senders: Arc<RwLock<HashMap<ConnectionId, mpsc::UnboundedSender<Vec<u8>>>>>,
+    message_senders: Arc<RwLock<HashMap<ConnectionId, mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl ConnectionManager {
@@ -181,12 +183,12 @@ impl ConnectionManager {
     /// # Returns
     /// 
     /// An unbounded receiver for messages targeted to this connection.
-    pub async fn register_message_channel(&self, connection_id: ConnectionId) -> mpsc::UnboundedReceiver<Vec<u8>> {
-        let (sender, receiver) = mpsc::unbounded_channel();
-        let mut senders = self.message_senders.write().await;
-        senders.insert(connection_id, sender);
-        tracing::debug!("📬 Registered message channel for connection {}", connection_id);
-        receiver
+    pub async fn register_message_channel(&self, connection_id: ConnectionId) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel(MESSAGE_CHANNEL_CAPACITY);
+    let mut senders = self.message_senders.write().await;
+    senders.insert(connection_id, sender);
+    tracing::debug!("📬 Registered bounded message channel for connection {} (capacity: {})", connection_id, MESSAGE_CHANNEL_CAPACITY);
+    receiver
     }
 
     /// Removes the message channel for a connection.
@@ -215,8 +217,15 @@ impl ConnectionManager {
     pub async fn send_to_connection(&self, connection_id: ConnectionId, message: Vec<u8>) {
         let senders = self.message_senders.read().await;
         if let Some(sender) = senders.get(&connection_id) {
-            if let Err(e) = sender.send(message) {
-                tracing::error!("Failed to send message to connection {}: {:?}", connection_id, e);
+            match sender.try_send(message) {
+                Ok(_) => {},
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("Message channel full for connection {}: dropping message", connection_id);
+                    // Optionally: disconnect slow client here
+                },
+                Err(e) => {
+                    tracing::error!("Failed to send message to connection {}: {:?}", connection_id, e);
+                }
             }
         } else {
             tracing::warn!("Attempted to send message to non-existent connection {}", connection_id);
@@ -236,17 +245,30 @@ impl ConnectionManager {
     /// 
     /// The number of connections that the message was sent to.
     pub async fn broadcast_to_all(&self, message: Vec<u8>) -> usize {
-        let senders = self.message_senders.read().await;
+        // Collect senders first to avoid holding the lock during send
+        let senders_vec: Vec<(ConnectionId, mpsc::Sender<Vec<u8>>)> = {
+            let senders = self.message_senders.read().await;
+            senders.iter()
+                .map(|(connection_id, sender)| (*connection_id, sender.clone()))
+                .collect()
+        };
+
         let mut sent_count = 0;
-        
-        for (connection_id, sender) in senders.iter() {
-            if let Err(e) = sender.send(message.clone()) {
-                tracing::error!("Failed to broadcast message to connection {}: {:?}", connection_id, e);
-            } else {
-                sent_count += 1;
+        for (connection_id, sender) in senders_vec {
+            match sender.try_send(message.clone()) {
+                Ok(_) => {
+                    sent_count += 1;
+                },
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!("Message channel full for connection {}: dropping message", connection_id);
+                    // Optionally: disconnect slow client here
+                },
+                Err(e) => {
+                    tracing::error!("Failed to broadcast message to connection {}: {:?}", connection_id, e);
+                }
             }
         }
-        
+
         tracing::debug!("📡 Broadcasted message to {} connections", sent_count);
         sent_count
     }
