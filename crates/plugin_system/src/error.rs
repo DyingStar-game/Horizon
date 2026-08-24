@@ -27,4 +27,7 @@ pub enum PluginSystemError {
     
     #[error("Plugin version mismatch: {0}")]
     VersionMismatch(String),
+
+    #[error("Lock poisoned: {0}")]
+    LockPoisoned(String),
 }

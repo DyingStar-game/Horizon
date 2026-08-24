@@ -482,9 +482,16 @@ impl PluginManager {
         // CRITICAL: Store the context to keep the luminal runtime alive!
         // This ensures spawned tasks continue running after initialization completes.
         {
-            let mut stored_context = self.server_context.write().expect("Failed to lock server_context for write");
-            *stored_context = Some(context.clone());
-            info!("🔧 Server context stored - luminal runtime will persist for plugin tasks");
+            match self.server_context.write() {
+                Ok(mut stored_context) => {
+                    *stored_context = Some(context.clone());
+                    info!("🔧 Server context stored - luminal runtime will persist for plugin tasks");
+                }
+                Err(poisoned) => {
+                    error!("❌ Failed to lock server_context for write: poisoned lock");
+                    return Err(PluginSystemError::LockPoisoned("server_context".to_string()));
+                }
+            }
         }
 
         // Phase 1: Pre-initialization (register handlers)
