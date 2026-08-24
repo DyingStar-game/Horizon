@@ -411,6 +411,13 @@ impl EventSystem {
                 info!("🔔 GORC: Player {} entered zone {} of object {} ({})", 
                       player_id, channel, object_id, instance.type_name);
             }
+
+            if instance.type_name == "player" {
+                // Also broadcast a server-side core event so plugins can react to zone enter.
+                if let Err(e) = self.emit_core("gorc_zone_entered", &zone_entry_event).await {
+                    warn!("⚠️ Failed to emit core gorc_zone_entered event: {}", e);
+                }
+            }
         } else {
             warn!("❌ GORC: No layer data available for object {} channel {}", object_id, channel);
         }
@@ -457,6 +464,20 @@ impl EventSystem {
             info!("🚪 GORC: Player {} exited zone {} of object {} ({})", 
                   player_id, channel, object_id, object_type);
         }
+
+        // if object_type == "player" {
+        //     // Also broadcast a server-side core event so plugins can react to zone exit.
+        //     let zone_exit_core = serde_json::json!({
+        //         "player_id": player_id.to_string(),
+        //         "object_id": object_id.to_string(),
+        //         "object_type": object_type,
+        //         "channel": channel,
+        //         "timestamp": crate::utils::current_timestamp(),
+        //     });
+        //     if let Err(e) = self.emit_core("gorc_zone_exited", &zone_exit_core).await {
+        //         warn!("⚠️ Failed to emit core gorc_zone_exited event: {}", e);
+        //     }
+        // }
         
         Ok(())
     }
