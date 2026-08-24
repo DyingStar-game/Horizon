@@ -427,6 +427,15 @@ impl GameServer {
     async fn register_core_handlers(&self) -> Result<(), ServerError> {
         // Core infrastructure events only - no game logic!
 
+        // Capture the host serving runtime handle. This method runs on the
+        // #[tokio::main(flavor = "multi_thread")] runtime, so Handle::current() here is the
+        // live host runtime. on_core_async handlers fire in contexts with NO ambient runtime
+        // (events are emitted from plugin dylibs; tokio's runtime context is per-dylib, so the
+        // plugin runtime's context does not satisfy host code). Downstream spawns therefore
+        // MUST use this explicit handle rather than bare tokio::spawn / Handle::try_current(),
+        // which panic "there is no reactor running".
+        let host_rt = tokio::runtime::Handle::current();
+
         self.horizon_event_system
             .on_core("player_connected", |event: PlayerConnectedEvent| {
                 info!(
@@ -463,14 +472,18 @@ impl GameServer {
         // Register authentication status management handlers
         let connection_manager_for_set = self.connection_manager.clone();
         let horizon_event_system_for_set = self.horizon_event_system.clone();
+        let host_rt_set = host_rt.clone();
         self.horizon_event_system
             .on_core_async("auth_status_set", move |event: AuthenticationStatusSetEvent| {
                 let conn_mgr = connection_manager_for_set.clone();
                 let event_system = horizon_event_system_for_set.clone();
-                
-                // Use block_on to execute async code in sync handler
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.block_on(async move {
+
+                // Spawn on the captured host runtime handle. The previous code did
+                // Handle::try_current().block_on(...), which panics "inconsistent park state"
+                // when the handler runs on a runtime worker (block_on within a runtime), and
+                // does nothing when there is no ambient runtime. spawn() on the host handle is
+                // correct from any context.
+                host_rt_set.spawn(async move {
                         // Get old status before setting new one
                         let old_status = conn_mgr.get_auth_status_by_player(event.player_id).await;
                         
@@ -496,7 +509,6 @@ impl GameServer {
                             warn!("⚠️ Failed to update auth status for player {} - player not found", event.player_id);
                         }
                     });
-                }
                 Ok(())
             })
             .await
@@ -504,16 +516,16 @@ impl GameServer {
 
         let connection_manager_for_get = self.connection_manager.clone();
         let horizon_event_system_for_get = self.horizon_event_system.clone();
+        let host_rt_get = host_rt.clone();
         self.horizon_event_system
             .on_core_async("auth_status_get", move |event: AuthenticationStatusGetEvent| {
                 let conn_mgr = connection_manager_for_get.clone();
                 let event_system = horizon_event_system_for_get.clone();
-                
-                // Use block_on to execute async code in sync handler
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.block_on(async move {
+
+                // Spawn on the captured host runtime handle (see auth_status_set above).
+                host_rt_get.spawn(async move {
                         let status = conn_mgr.get_auth_status_by_player(event.player_id).await;
-                        
+
                         // Emit response event with the queried status
                         let response_event = AuthenticationStatusGetResponseEvent {
                             player_id: event.player_id,
@@ -521,16 +533,15 @@ impl GameServer {
                             status,
                             timestamp: current_timestamp(),
                         };
-                        
+
                         if let Err(e) = event_system.emit_core("auth_status_get_response", &response_event).await {
-                            warn!("⚠️ Failed to emit auth status response for player {} request {}: {:?}", 
+                            warn!("⚠️ Failed to emit auth status response for player {} request {}: {:?}",
                                   event.player_id, event.request_id, e);
                         } else {
-                            info!("🔍 Auth status query response for player {}: {:?} (request: {})", 
+                            info!("🔍 Auth status query response for player {}: {:?} (request: {})",
                                   event.player_id, status, event.request_id);
                         }
                     });
-                }
                 Ok(())
             })
             .await
@@ -551,9 +562,11 @@ impl GameServer {
         // This allows plugins to replace the temporary connection-level player_id
         // with a permanent database player_id after authentication
         let connection_manager_for_update = self.connection_manager.clone();
+        let host_rt_update = host_rt.clone();
         self.horizon_event_system
             .on_core_async("update_player_id", move |event: serde_json::Value| {
                 let conn_mgr = connection_manager_for_update.clone();
+                let host_rt_update = host_rt_update.clone();
 
                 info!("🔄 Received update_player_id event: {:?}", event);
 
@@ -562,9 +575,9 @@ impl GameServer {
                 let new_player_id = serde_json::from_value::<horizon_event_system::PlayerId>(event["new_player_id"].clone());
 
                 if let (Ok(old_player_id), Ok(new_player_id)) = (old_player_id, new_player_id) {
-                    // Spawn a dedicated thread with its own runtime to handle the async work
-                    // This is necessary because on_core_async handlers don't have a guaranteed tokio runtime context
-                    tokio::spawn(async move {
+                    // Spawn on the captured host runtime handle (NOT bare tokio::spawn — this
+                    // handler has no ambient runtime, see host_rt capture above).
+                    host_rt_update.spawn(async move {
                         // Get the connection_id for this player
                         if let Some(connection_id) = conn_mgr.get_connection_id_by_player(old_player_id).await {
                             // Update the player_id stored in the connection
@@ -587,8 +600,9 @@ impl GameServer {
             .map_err(|e| ServerError::Internal(e.to_string()))?;
 
         // Register a simple ping handler for testing validity of the client connection
+        let host_rt_ping = host_rt.clone();
         self.horizon_event_system
-            .on_client("system", "ping", |data: serde_json::Value, player_id: horizon_event_system::PlayerId, conn| {
+            .on_client("system", "ping", move |data: serde_json::Value, player_id: horizon_event_system::PlayerId, conn| {
                 info!("🔧 GameServer: Received 'ping' event with connection: {:?}, data: {:?}", conn, data);
 
                 let response = serde_json::json!({
@@ -598,9 +612,8 @@ impl GameServer {
 
                 debug!("🔧 GameServer: Responding to 'ping' event with response: {:?}", response);
 
-                // Use block_on to execute async response in sync handler
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.block_on(async {
+                // Spawn on the captured host runtime handle (see host_rt capture above).
+                host_rt_ping.spawn(async move {
                         let response_bytes = match serde_json::to_vec(&response) {
                             Ok(bytes) => bytes,
                             Err(e) => {
@@ -613,7 +626,6 @@ impl GameServer {
                             error!("Failed to send ping response: {}", e);
                         }
                     });
-                }
 
                 Ok(())
         }).await.map_err(|e| ServerError::Internal(e.to_string()))?;
