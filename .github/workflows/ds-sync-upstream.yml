@@ -1,0 +1,49 @@
+# Keeps `main` a strict mirror of Far-Beyond-Dev/Horizon.
+#
+# Our own work never lands on `main` — it lives on ds-develop / ds-main, which
+# are rebased onto `main` by hand (see docs in the horizonserver repo). This
+# workflow lives on ds-develop because scheduled workflows only run from the
+# repository's default branch.
+name: Sync upstream main
+
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fast-forward main to upstream/main
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/Far-Beyond-Dev/Horizon.git
+          git fetch upstream main --tags
+
+          before=$(git rev-parse refs/remotes/origin/main)
+          after=$(git rev-parse refs/remotes/upstream/main)
+
+          if [ "$before" = "$after" ]; then
+            echo "main already at $after — nothing to do."
+            exit 0
+          fi
+
+          # Non-forced on purpose: a rejection here means someone committed to
+          # main, which breaks the mirror invariant and must be looked at.
+          git push origin "$after:refs/heads/main"
+          git push origin --tags
+
+          echo "main: $before -> $after" >> "$GITHUB_STEP_SUMMARY"
+          git log --oneline "$before..$after" >> "$GITHUB_STEP_SUMMARY"
