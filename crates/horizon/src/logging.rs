@@ -6,6 +6,8 @@
 use crate::config::LoggingSettings;
 use tracing::info;
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tokio_blocked::TokioBlockedLayer;
+use std::time::Duration;
 
 /// Initializes the logging system with the specified configuration.
 /// 
@@ -35,7 +37,10 @@ pub fn setup_logging(
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(log_level));
 
-    let registry = tracing_subscriber::registry().with(filter);
+    let blocked = TokioBlockedLayer::new()
+        .with_warn_busy_single_poll(Some(Duration::from_micros(150)));
+
+    let registry = tracing_subscriber::registry().with(filter).with(blocked);
 
     if json_format || config.json_format {
         // JSON formatting with thread info for structured logging

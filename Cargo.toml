@@ -13,6 +13,10 @@ horizon_sockets = { git = "https://github.com/Far-Beyond-Dev/Horizon-Sockets", r
 luminal_rt = "0.4.1"
 tokio = { version = "1.48", features = ["full"] }
 tokio-tungstenite = "0.27.0"
+# tokio-metrics = { version = "0.4.6", features = ["metrics-rs-integration"] }
+metrics = "0.24"
+# metrics-exporter-prometheus = { version = "0.18", features = ["uds-listener"] }
+tokio-blocked = "*"
 
 # === CLI & Configuration ===
 clap = { version = "4.0", features = ["derive"] }

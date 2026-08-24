@@ -50,6 +50,7 @@ use app::Application;
 use cli::CliArgs;
 use config::AppConfig;
 use horizon_event_system::async_logging;
+use std::net::SocketAddr;
 
 /// Main entry point for the Horizon Game Server.
 /// 
@@ -68,6 +69,17 @@ use horizon_event_system::async_logging;
 /// Note: This function is called from an async context (main with #[tokio::main]),
 /// so it should NOT have #[tokio::main] itself.
 pub async fn init() -> Result<(), Box<dyn std::error::Error>> {
+
+    
+    // run metrics with prometheus exporter
+    // metrics_exporter_prometheus::PrometheusBuilder::new()
+    //     .with_http_listener(SocketAddr::from(([0, 0, 0, 0], 9000)))
+    //     .install()
+    //     .unwrap();
+
+    // tokio::task::spawn(
+    //     tokio_metrics::RuntimeMetricsReporterBuilder::default().describe_and_run(),
+    // );
 
     // Parse CLI arguments first
     let args = CliArgs::parse();
