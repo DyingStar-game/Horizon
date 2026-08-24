@@ -54,3 +54,13 @@ config.toml
 /crates/plugin_stars_beyond
 /crates/plugin_flex_inventory
 *.log
+
+######################
+# DyingStar (ds-*)   #
+######################
+# Runtime configs injected by horizonserver/scripts/install.sh — they live in
+# the horizonserver repo, not here, so the fork stays pure upstream + patches.
+/plugins.toml
+/dev_config.toml
+/my_config.toml*
+*.sock
