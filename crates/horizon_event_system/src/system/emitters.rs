@@ -209,8 +209,7 @@ impl EventSystem {
         })?;
         
         // Get the replication layer for this channel
-        let layers = instance.object.get_layers();
-        let layer = layers.iter().find(|l| l.channel == channel).ok_or_else(|| {
+        let layer = instance.cached_layers.iter().find(|l| l.channel == channel).ok_or_else(|| {
             EventError::HandlerExecution(format!("Channel {} not defined for object {}", channel, object_id))
         })?;
         
