@@ -570,6 +570,32 @@ impl GorcInstanceManager {
 
         debug!("🎮 GORC: Zone changes for player {} - {} entries, {} exits", player_id, zone_entries.len(), zone_exits.len());
 
+        // Apply the transitions we just detected to the subscriber lists, so that what the
+        // client is told and what the server replicates cannot diverge.
+        //
+        // The sweep above decides zone entry/exit per movement packet, but subscriptions used
+        // to be refreshed only by recalculate_player_subscriptions() below, i.e. once the
+        // player had moved more than 5 m. Between the two, a player could be sent a zone-exit
+        // message and stay subscribed — it keeps receiving that object's `move` events after
+        // its client dropped the object (a remote player that "keeps walking" past the zone
+        // radius). Conversely a subscription could linger or vanish behind the messages, and
+        // recalculate_subscriptions_for_object_with_events() only emits an exit when
+        // is_subscribed() is true — so the mirrored exit was silently skipped and the remote
+        // player stayed on screen, frozen, forever.
+        //
+        // Done in a second pass: self.objects.iter() above holds DashMap shard guards, and
+        // taking get_mut() on the same shard from inside that loop would deadlock.
+        for (object_id, channel) in &zone_entries {
+            if let Some(mut instance) = self.objects.get_mut(object_id) {
+                instance.add_subscriber(*channel, player_id);
+            }
+        }
+        for (object_id, channel) in &zone_exits {
+            if let Some(mut instance) = self.objects.get_mut(object_id) {
+                instance.remove_subscriber(*channel, player_id);
+            }
+        }
+
         // If this is a new player or they moved significantly, recalculate subscriptions
         const MOVEMENT_THRESHOLD_SQ: f64 = 25.0; // 5.0 * 5.0
         if old_position.is_none() || 
@@ -761,6 +787,39 @@ impl GorcInstanceManager {
             None => {
                 debug!("🗑️ Dropped stale update for unregistered object {}", object_id);
                 false
+            }
+        }
+    }
+
+    /// Apply a mutation to an object instance **in place**, while its map entry is locked.
+    ///
+    /// Prefer this over the `get_object()` → mutate → [`update_object`] cycle on any path that
+    /// can run concurrently for the same object. That cycle works on a *clone*: two handlers
+    /// racing on one object — a movement packet and a property update, each at ~30 Hz — both
+    /// write back a snapshot taken before the other's change, and whichever lands last silently
+    /// reverts the other. A field the client sends only once, such as the `parent_id` of a
+    /// reparent, is then lost for good: the loser of the race restores the old parent forever,
+    /// every later global position is computed against the wrong parent, and the player ends up
+    /// thousands of kilometres away from the world it should see.
+    ///
+    /// It also avoids clobbering the replication bookkeeping: `zone_manager`, `subscribers`,
+    /// `last_updates` and `stats` stay untouched unless the closure changes them, so a
+    /// subscription added or dropped by another task in the meantime survives.
+    ///
+    /// The closure runs while the entry is locked — it must not call back into this manager, and
+    /// it cannot await.
+    ///
+    /// Returns `None` if the object is no longer registered.
+    pub async fn with_object_mut<R>(
+        &self,
+        object_id: GorcObjectId,
+        f: impl FnOnce(&mut ObjectInstance) -> R,
+    ) -> Option<R> {
+        match self.objects.get_mut(&object_id) {
+            Some(mut entry) => Some(f(entry.value_mut())),
+            None => {
+                debug!("🗑️ Dropped stale in-place update for unregistered object {}", object_id);
+                None
             }
         }
     }
