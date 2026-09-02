@@ -250,7 +250,11 @@ impl EventSystem {
         let mut sent_count = 0;
         for player_id in subscribers {
             if let Err(e) = sender.send_to_client(player_id, data.clone()).await {
-                warn!("Failed to send GORC event to player {}: {}", player_id, e);
+                // debug!, not warn!: a subscriber that went away produces one line per
+                // replicated event per tick. On preprod three stale subscribers alone
+                // pushed this to ~700 lines/s, which cut the pod's log retention to 97
+                // seconds and made incidents impossible to investigate after the fact.
+                debug!("Failed to send GORC event to player {}: {}", player_id, e);
             } else {
                 sent_count += 1;
             }

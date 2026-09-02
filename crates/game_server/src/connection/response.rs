@@ -72,7 +72,10 @@ impl ClientResponseSender for GameServerResponseSender {
                 tracing::debug!("🔧 GameServerResponseSender: Message sent to connection {}", connection_id);
                 Ok(())
             } else {
-                tracing::error!("🔧 GameServerResponseSender: Player {} not found or not connected", player_id);
+                // debug!, not error!: this is the normal outcome whenever anything is
+                // sent to a player who just disconnected, and it fires once per
+                // replicated event. See the matching note in emitters.rs.
+                tracing::debug!("🔧 GameServerResponseSender: Player {} not found or not connected", player_id);
                 Err(format!("Player {} not found or not connected", player_id))
             }
         })
