@@ -5,6 +5,7 @@ use super::client::ClientResponseSender;
 use super::stats::EventSystemStats;
 use super::path_router::PathRouter;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 // use smallvec::SmallVec;
 use compact_str::CompactString;
@@ -27,6 +28,14 @@ pub struct EventSystem {
     pub(super) path_router: RwLock<PathRouter>,
     /// System statistics for monitoring (kept as RwLock for atomic updates)
     pub(super) stats: tokio::sync::RwLock<EventSystemStats>,
+    /// Emission counters, kept out of `stats`: every emit used to take
+    /// `stats.write().await`, one async lock shared by every handler of every
+    /// plugin. Polled by luminal (which re-polls a pending task at once) during a
+    /// burst of a few thousand concurrent emits (genericprops startup, 400
+    /// players), its waiter list became a convoy that froze every luminal worker
+    /// (preprod, 2026-10-01).
+    pub(super) events_emitted: AtomicU64,
+    pub(super) gorc_events_emitted: AtomicU64,
     /// High-performance serialization buffer pool to reduce allocations
     pub(super) serialization_pool: SerializationBufferPool,
     /// GORC instance manager for object-specific events
@@ -53,6 +62,8 @@ impl EventSystem {
             handlers: DashMap::new(),
             path_router: RwLock::new(PathRouter::new()),
             stats: tokio::sync::RwLock::new(EventSystemStats::default()),
+            events_emitted: AtomicU64::new(0),
+            gorc_events_emitted: AtomicU64::new(0),
             serialization_pool: SerializationBufferPool::default(),
             gorc_instances: None,
             client_response_sender: None,
@@ -65,6 +76,8 @@ impl EventSystem {
             handlers: DashMap::new(),
             path_router: RwLock::new(PathRouter::new()),
             stats: tokio::sync::RwLock::new(EventSystemStats::default()),
+            events_emitted: AtomicU64::new(0),
+            gorc_events_emitted: AtomicU64::new(0),
             serialization_pool: SerializationBufferPool::default(),
             gorc_instances: Some(gorc_instances),
             client_response_sender: None,
@@ -91,7 +104,10 @@ impl EventSystem {
     /// Gets the current event system statistics
     #[inline]
     pub async fn get_stats(&self) -> EventSystemStats {
-        self.stats.read().await.clone()
+        let mut stats = self.stats.read().await.clone();
+        stats.events_emitted = self.events_emitted.load(Ordering::Relaxed);
+        stats.gorc_events_emitted = self.gorc_events_emitted.load(Ordering::Relaxed);
+        stats
     }
     
     /// Gets access to the GORC instances manager (if available)

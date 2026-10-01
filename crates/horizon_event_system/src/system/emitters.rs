@@ -649,13 +649,10 @@ impl EventSystem {
                 while let Some(_) = futures.next().await {};
             }
 
-            // Batch stats updates to reduce lock contention
-            let mut stats = self.stats.write().await;
-            stats.events_emitted += 1;
-            
-            // Update GORC-specific stats with branch prediction optimization
-            if event_key.as_bytes().get(0) == Some(&b'g') && event_key.starts_with("gorc") {
-                stats.gorc_events_emitted += 1;
+            // Lock-free: see `EventSystem::events_emitted`.
+            self.events_emitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if event_key.starts_with("gorc") {
+                self.gorc_events_emitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         } else {
             // Show debugging info for missing handlers (except server_tick spam)
