@@ -7,6 +7,7 @@ const MESSAGE_CHANNEL_CAPACITY: usize = 1000;
 
 use super::{client::ClientConnection, ConnectionId};
 use horizon_event_system::{PlayerId, AuthenticationStatus};
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,6 +41,11 @@ pub struct ConnectionManager {
     
     /// Per-connection message senders for O(1) message delivery
     message_senders: Arc<RwLock<HashMap<ConnectionId, mpsc::Sender<Vec<u8>>>>>,
+
+    /// Player → connection index, kept by set_player_id / remove_connection. Every
+    /// send_to_client resolves its player here: the linear scan of `connections` it
+    /// replaces was most of the LOD delivery thread at 1256 players (80k sends/s).
+    player_connections: Arc<DashMap<PlayerId, ConnectionId>>,
 }
 
 impl ConnectionManager {
@@ -57,6 +63,7 @@ impl ConnectionManager {
             ws_senders: Arc::new(RwLock::new(HashMap::new())),
             next_id: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             message_senders: Arc::new(RwLock::new(HashMap::new())),
+            player_connections: Arc::new(DashMap::new()),
         }
     }
 
@@ -133,6 +140,9 @@ impl ConnectionManager {
     pub async fn remove_connection(&self, connection_id: ConnectionId) {
         let mut connections = self.connections.write().await;
         if let Some(connection) = connections.remove(&connection_id) {
+            if let Some(player_id) = connection.player_id {
+                self.player_connections.remove_if(&player_id, |_, conn| *conn == connection_id);
+            }
             info!(
                 "❌ Connection {} from {} disconnected",
                 connection_id, connection.remote_addr
@@ -152,7 +162,10 @@ impl ConnectionManager {
     pub async fn set_player_id(&self, connection_id: ConnectionId, player_id: PlayerId) {
         let mut connections = self.connections.write().await;
         if let Some(connection) = connections.get_mut(&connection_id) {
-            connection.player_id = Some(player_id);
+            if let Some(previous) = connection.player_id.replace(player_id) {
+                self.player_connections.remove_if(&previous, |_, conn| *conn == connection_id);
+            }
+            self.player_connections.insert(player_id, connection_id);
         }
     }
 
@@ -287,13 +300,7 @@ impl ConnectionManager {
     /// The `ConnectionId` if the player is found and connected,
     /// or `None` if the player is not currently connected.
     pub async fn get_connection_id_by_player(&self, player_id: PlayerId) -> Option<ConnectionId> {
-        let connections = self.connections.read().await;
-        for (conn_id, connection) in connections.iter() {
-            if connection.player_id == Some(player_id) {
-                return Some(*conn_id);
-            }
-        }
-        None
+        self.player_connections.get(&player_id).map(|conn| *conn)
     }
 
     /// Sets the authentication status for a connection.
@@ -336,13 +343,9 @@ impl ConnectionManager {
     /// 
     /// The current authentication status, or `None` if the player is not connected.
     pub async fn get_auth_status_by_player(&self, player_id: PlayerId) -> Option<AuthenticationStatus> {
+        let connection_id = self.get_connection_id_by_player(player_id).await?;
         let connections = self.connections.read().await;
-        for connection in connections.values() {
-            if connection.player_id == Some(player_id) {
-                return Some(connection.auth_status());
-            }
-        }
-        None
+        connections.get(&connection_id).map(|c| c.auth_status())
     }
 
     /// Sets the authentication status for a player.
@@ -358,14 +361,17 @@ impl ConnectionManager {
     /// 
     /// `true` if the player was found and updated, `false` otherwise.
     pub async fn set_auth_status_by_player(&self, player_id: PlayerId, status: AuthenticationStatus) -> bool {
+        let Some(connection_id) = self.get_connection_id_by_player(player_id).await else {
+            return false;
+        };
         let mut connections = self.connections.write().await;
-        for connection in connections.values_mut() {
-            if connection.player_id == Some(player_id) {
+        match connections.get_mut(&connection_id) {
+            Some(connection) => {
                 connection.set_auth_status(status);
-                return true;
+                true
             }
+            None => false,
         }
-        false
     }
 
     /// Gets detailed connection information for a player.
@@ -378,12 +384,10 @@ impl ConnectionManager {
     /// 
     /// Connection information if the player is connected, `None` otherwise.
     pub async fn get_connection_info_by_player(&self, player_id: PlayerId) -> Option<(ConnectionId, SocketAddr, std::time::SystemTime, AuthenticationStatus)> {
+        let connection_id = self.get_connection_id_by_player(player_id).await?;
         let connections = self.connections.read().await;
-        for (conn_id, connection) in connections.iter() {
-            if connection.player_id == Some(player_id) {
-                return Some((*conn_id, connection.remote_addr, connection.connected_at, connection.auth_status()));
-            }
-        }
-        None
+        connections
+            .get(&connection_id)
+            .map(|connection| (connection_id, connection.remote_addr, connection.connected_at, connection.auth_status()))
     }
 }

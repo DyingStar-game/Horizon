@@ -7,6 +7,7 @@ edition = "2021"
 horizon_event_system = { workspace = true }
 Horizon-Network-Common = { workspace = true }
 tokio-tungstenite = { workspace = true }
+dashmap = { workspace = true }
 # Use mio-runtime only for musl targets to avoid monoio compatibility issues
 [target.'cfg(target_env = "musl")'.dependencies]
 horizon_sockets = { workspace = true, default-features = false, features = ["mio-runtime"] }
