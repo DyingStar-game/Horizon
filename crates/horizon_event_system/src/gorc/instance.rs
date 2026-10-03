@@ -484,12 +484,13 @@ impl GorcInstanceManager {
         Some((old_position, new_position, zone_changes))
     }
 
-    /// Minimum squared movement (0.5m * 0.5m) before the full zone sweep re-runs
-    /// for a player. Zone radii are measured in tens of meters, so a half-meter
-    /// hysteresis is imperceptible — but movement packets arrive at up to 60Hz,
-    /// so skipping sub-threshold moves cuts the per-packet O(objects) sweep by
-    /// an order of magnitude for walking players and entirely for idle ones.
-    const MIN_ZONE_SWEEP_MOVEMENT_SQ: f64 = 0.25;
+    /// Minimum squared movement (2m * 2m) before the full zone sweep re-runs
+    /// for a player. The sweep is O(objects) — thousands of props — and was the
+    /// main cost of a movement packet at 700 players (preprod 2026-10-03, ~13 ms
+    /// of CPU per applied move). The smallest zone radius is 100 m, so a crossing
+    /// detected up to 2 m late is imperceptible; it must stay under the 5 m of
+    /// MOVEMENT_THRESHOLD_SQ below, or every sweep would also recalculate.
+    const MIN_ZONE_SWEEP_MOVEMENT_SQ: f64 = 4.0;
 
     /// Update a player's position and return zone membership changes
     pub async fn update_player_position(&self, player_id: PlayerId, new_position: Vec3) -> (Vec<(GorcObjectId, u8)>, Vec<(GorcObjectId, u8)>) {
@@ -510,13 +511,10 @@ impl GorcInstanceManager {
         // Get old position and update to new position
         let old_position = self.player_positions.insert(player_id, new_position);
 
-        {
-            let spatial_position: Position = new_position.into();
-            let partition = self.spatial_index.read().await;
-            partition
-                .update_player_position(player_id, spatial_position)
-                .await;
-        }
+        // The spatial index is NOT updated here: nothing reads it at runtime (only
+        // get_objects_in_range, used by tests), and SpatialPartition takes a global
+        // write lock per update — 43 of 78 luminal samples waited on it at 700
+        // players. Players are still added / removed in add_player / remove_player.
 
 
         // Check all objects for zone membership changes (lock-free iteration over DashMap)
