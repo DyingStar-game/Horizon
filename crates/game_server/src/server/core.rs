@@ -385,8 +385,11 @@ impl GameServer {
                                 });
                             }
                             Err(e) => {
-                                error!("Failed to accept connection: {}", e);
-                                break;
+                                // accept() errors are per-connection or transient (EMFILE when
+                                // out of file descriptors, ECONNABORTED): leaving the loop
+                                // stopped the listener for good while the server kept running.
+                                error!("Failed to accept connection: {} - retrying in 100 ms", e);
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                             }
                         }
                     }
