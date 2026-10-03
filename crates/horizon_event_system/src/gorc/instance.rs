@@ -872,6 +872,16 @@ impl GorcInstanceManager {
         result
     }
     
+    /// Every tracked player position, copied out: no lock is held once it returns.
+    /// For callers that answer many radius queries in a row (the LOD delivery loop):
+    /// one copy bucketed on their side instead of one full scan per query.
+    pub fn player_positions_snapshot(&self) -> Vec<(PlayerId, Vec3)> {
+        self.player_positions
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect()
+    }
+
     /// Find all players within radius of a position (for event-driven GORC emission)
     pub async fn find_players_in_radius(&self, position: Vec3, radius: f64) -> Vec<PlayerId> {
         let player_positions = &self.player_positions;
