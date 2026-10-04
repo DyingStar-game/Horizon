@@ -290,6 +290,10 @@ impl EventSystem {
 
         // Handle zone exits - send zone exit messages to inform client
         for (object_id, channel) in zone_exits {
+            if object_id.0 == player_id.0 {
+                // Never tell a player it left its own object's zone: see send_zone_exit_message.
+                continue;
+            }
             debug!("🎮 EVENT DEBUG: Sending zone exit message for object {} channel {}", object_id, channel);
             self.send_zone_exit_message(player_id, object_id, channel).await?;
         }
@@ -340,7 +344,7 @@ impl EventSystem {
                     debug!("🎮 GORC Object Movement: Sending zone entry message for object {} channel {} to player {}",
                            object_id, channel, player_id);
                     self.send_zone_entry_message(player_id, object_id, channel).await?;
-                } else {
+                } else if object_id.0 != player_id.0 {
                     debug!("🎮 GORC Object Movement: Sending zone exit message for object {} channel {} to player {}",
                            object_id, channel, player_id);
                     self.send_zone_exit_message(player_id, object_id, channel).await?;
@@ -429,7 +433,13 @@ impl EventSystem {
         Ok(())
     }
 
-    /// Send zone exit message to inform player they left an object's zone
+    /// Send zone exit message to inform player they left an object's zone.
+    ///
+    /// Never called for the player's own object: the observer position and the
+    /// object position are updated by separate calls, so a jump of the body (a
+    /// hand-over between game servers re-spawning it elsewhere) briefly puts the
+    /// player out of its own zones. The client then dropped its own body and its
+    /// camera fell to another avatar's (preprod, 2026-10-04).
     async fn send_zone_exit_message(&self, player_id: PlayerId, object_id: GorcObjectId, channel: u8) -> Result<(), EventError> {
         // Get the client response sender
         let sender = self.client_response_sender.as_ref().ok_or_else(|| {
