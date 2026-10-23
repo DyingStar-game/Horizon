@@ -5,13 +5,13 @@
 
 const MESSAGE_CHANNEL_CAPACITY: usize = 1000;
 
-use super::{client::ClientConnection, ConnectionId};
+use super::{client::ClientConnection, outbox::{self, Outbox, OutboxReceiver, Pushed}, ConnectionId};
 use horizon_event_system::{PlayerId, AuthenticationStatus};
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tracing::info;
 use futures_util::sink::SinkExt;
 use futures_util::stream::SplitSink;
@@ -39,8 +39,8 @@ pub struct ConnectionManager {
     /// Atomic counter for generating unique connection IDs
     next_id: Arc<std::sync::atomic::AtomicUsize>,
     
-    /// Per-connection message senders for O(1) message delivery
-    message_senders: Arc<RwLock<HashMap<ConnectionId, mpsc::Sender<Vec<u8>>>>>,
+    /// Per-connection outboxes for O(1) message delivery (never dropping, see outbox.rs)
+    message_senders: Arc<RwLock<HashMap<ConnectionId, Outbox>>>,
 
     /// Player → connection index, kept by set_player_id / remove_connection. Every
     /// send_to_client resolves its player here: the linear scan of `connections` it
@@ -195,12 +195,13 @@ impl ConnectionManager {
     /// 
     /// # Returns
     /// 
-    /// An unbounded receiver for messages targeted to this connection.
-    pub async fn register_message_channel(&self, connection_id: ConnectionId) -> mpsc::Receiver<Vec<u8>> {
-    let (sender, receiver) = mpsc::channel(MESSAGE_CHANNEL_CAPACITY);
+    /// The receiver of the messages targeted to this connection: a bounded channel with
+    /// a backlog behind it, so a slow client loses nothing (see outbox.rs).
+    pub async fn register_message_channel(&self, connection_id: ConnectionId) -> OutboxReceiver {
+    let (sender, receiver) = outbox::outbox(connection_id, MESSAGE_CHANNEL_CAPACITY);
     let mut senders = self.message_senders.write().await;
     senders.insert(connection_id, sender);
-    tracing::debug!("📬 Registered bounded message channel for connection {} (capacity: {})", connection_id, MESSAGE_CHANNEL_CAPACITY);
+    tracing::debug!("📬 Registered message channel for connection {} (capacity: {}, then backlog)", connection_id, MESSAGE_CHANNEL_CAPACITY);
     receiver
     }
 
@@ -230,15 +231,9 @@ impl ConnectionManager {
     pub async fn send_to_connection(&self, connection_id: ConnectionId, message: Vec<u8>) {
         let senders = self.message_senders.read().await;
         if let Some(sender) = senders.get(&connection_id) {
-            match sender.try_send(message) {
-                Ok(_) => {},
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!("Message channel full for connection {}: dropping message", connection_id);
-                    // Optionally: disconnect slow client here
-                },
-                Err(e) => {
-                    tracing::error!("Failed to send message to connection {}: {:?}", connection_id, e);
-                }
+            // Queued or deferred: delivered either way. Cut: the outbox said why, once.
+            if sender.push(message) == Pushed::Closed {
+                tracing::debug!("Connection {} is closing: message not sent", connection_id);
             }
         } else {
             tracing::warn!("Attempted to send message to non-existent connection {}", connection_id);
@@ -259,7 +254,7 @@ impl ConnectionManager {
     /// The number of connections that the message was sent to.
     pub async fn broadcast_to_all(&self, message: Vec<u8>) -> usize {
         // Collect senders first to avoid holding the lock during send
-        let senders_vec: Vec<(ConnectionId, mpsc::Sender<Vec<u8>>)> = {
+        let senders_vec: Vec<(ConnectionId, Outbox)> = {
             let senders = self.message_senders.read().await;
             senders.iter()
                 .map(|(connection_id, sender)| (*connection_id, sender.clone()))
@@ -268,17 +263,10 @@ impl ConnectionManager {
 
         let mut sent_count = 0;
         for (connection_id, sender) in senders_vec {
-            match sender.try_send(message.clone()) {
-                Ok(_) => {
-                    sent_count += 1;
-                },
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    tracing::warn!("Message channel full for connection {}: dropping message", connection_id);
-                    // Optionally: disconnect slow client here
-                },
-                Err(e) => {
-                    tracing::error!("Failed to broadcast message to connection {}: {:?}", connection_id, e);
-                }
+            match sender.push(message.clone()) {
+                Pushed::Queued | Pushed::Deferred => sent_count += 1,
+                Pushed::Cut => {}
+                Pushed::Closed => tracing::debug!("Connection {} is closing: broadcast not sent", connection_id),
             }
         }
 

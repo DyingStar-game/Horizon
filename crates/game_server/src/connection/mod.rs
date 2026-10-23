@@ -5,6 +5,7 @@
 
 pub mod client;
 pub mod manager;
+pub mod outbox;
 pub mod response;
 
 pub use manager::ConnectionManager;

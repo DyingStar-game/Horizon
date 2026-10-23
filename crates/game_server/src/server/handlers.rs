@@ -143,12 +143,16 @@ pub async fn handle_connection(
             while let Some(message) = message_receiver.recv().await {
                 let message_text = String::from_utf8_lossy(&message);
                 let mut ws_sender = ws_sender.lock().await;
-                if let Err(e) = ws_sender
-                    .send(Message::Text(message_text.to_string().into()))
-                    .await
-                {
-                    error!("Failed to send message: {}", e);
-                    break;
+                // A client that stopped reading blocks this send on a full socket: the
+                // outbox cutting the connection is what ends it (see outbox.rs).
+                tokio::select! {
+                    sent = ws_sender.send(Message::Text(message_text.to_string().into())) => {
+                        if let Err(e) = sent {
+                            error!("Failed to send message: {}", e);
+                            break;
+                        }
+                    }
+                    _ = message_receiver.cut() => break,
                 }
             }
         }
