@@ -8,12 +8,12 @@ use crate::{
     config::ServerConfig,
     connection::{ConnectionManager, GameServerResponseSender},
     error::ServerError,
-    server::handlers::handle_connection,
+    server::handlers::{handle_connection, ListenerSettings},
 };
 use plugin_system::PluginManager;
 use futures::stream::{FuturesUnordered, StreamExt as FuturesStreamExt};
 use horizon_event_system::{
-    current_timestamp, EventSystem, GorcManager, MulticastManager,
+    current_timestamp, EventSystem, GorcManager, ListenerProfile, MulticastManager, Transport,
     PlayerConnectedEvent, PlayerDisconnectedEvent, RegionId, RegionStartedEvent, SpatialPartition,
     SubscriptionManager, AuthenticationStatusSetEvent, AuthenticationStatusGetEvent, 
     AuthenticationStatusGetResponseEvent, AuthenticationStatusChangedEvent, ShutdownState,
@@ -350,6 +350,12 @@ impl GameServer {
         let mut shutdown_receiver = self.shutdown_sender.subscribe();
 
         // Create futures for all accept loops with shutdown monitoring
+        let listener_settings = ListenerSettings {
+            profile: ListenerProfile::new(Transport::WebSocket).with_format(self.config.websocket.protocol),
+            max_frame_size: self.config.security.max_message_size,
+            max_decode_errors: self.config.security.max_decode_errors,
+        };
+        info!("🔌 WebSocket listener speaks {}", self.config.websocket.protocol);
         let mut accept_futures = listeners
             .into_iter()
             .map(|listener| {
@@ -379,6 +385,7 @@ impl GameServer {
                                         addr,
                                         connection_manager,
                                         horizon_event_system,
+                                        listener_settings,
                                     ).await {
                                         error!("Connection error: {:?}", e);
                                     }

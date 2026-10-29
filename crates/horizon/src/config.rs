@@ -54,6 +54,19 @@ pub struct ServerSettings {
     /// Server tick interval in milliseconds (0 to disable)
     #[serde(default = "default_tick_interval")]
     pub tick_interval_ms: u64,
+    /// WebSocket listener settings (`[server.websocket]`); the listener's address is
+    /// `bind_address`
+    #[serde(default)]
+    pub websocket: WebSocketSettings,
+}
+
+/// `[server.websocket]`: settings of the WebSocket listener. Every key is optional;
+/// without the table the listener speaks JSON, as it always has.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebSocketSettings {
+    /// Message format: "json" (default) or "bitcode"
+    #[serde(default)]
+    pub protocol: horizon_event_system::Format,
 }
 
 /// Default for connection_timeout
@@ -390,6 +403,7 @@ impl Default for AppConfig {
                 connection_timeout: 60,
                 use_reuse_port: false,
                 tick_interval_ms: 50,
+                websocket: WebSocketSettings::default(),
             },
             plugins: PluginSettings {
                 directory: "plugins".to_string(),
@@ -464,6 +478,9 @@ impl AppConfig {
             tick_interval_ms: self.server.tick_interval_ms,
             security: Default::default(),
             plugin_safety,
+            websocket: game_server::config::WebSocketConfig {
+                protocol: self.server.websocket.protocol,
+            },
         })
     }
 
@@ -634,6 +651,7 @@ mod tests {
             connection_timeout: 120,
             use_reuse_port: true,
             tick_interval_ms: 16,
+            websocket: WebSocketSettings::default(),
         };
 
         assert_eq!(settings.bind_address, "0.0.0.0:9999");
@@ -778,6 +796,7 @@ file_path = "/tmp/test.log"
                 connection_timeout: 180,
                 use_reuse_port: true,
                 tick_interval_ms: 25,
+                websocket: WebSocketSettings::default(),
             },
             plugins: PluginSettings {
                 directory: "/srv/plugins".to_string(),

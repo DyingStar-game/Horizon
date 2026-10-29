@@ -53,6 +53,7 @@ impl ReplicationCoordinator {
                     properties: vec![], // Use all properties
                     compression: CompressionType::None,
                     priority: ReplicationPriority::Normal,
+                    delivery: crate::Delivery::Reliable,
                 };
                 let serialized_data = match object_instance.object.serialize_for_layer(&core_layer) {
                     Ok(data) => data,

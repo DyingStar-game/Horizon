@@ -589,6 +589,22 @@ impl EventSystem {
                 }
             };
 
+            // Bitcode clients' payloads travel as bytes; JSON clients' as a JSON value.
+            let format = match event_data.get("format").and_then(|v| v.as_str()) {
+                Some("bitcode") => horizon_protocol::Format::Bitcode,
+                _ => horizon_protocol::Format::Json,
+            };
+            let data = match format {
+                horizon_protocol::Format::Bitcode => event_data
+                    .get("data")
+                    .and_then(|v| serde_json::from_value::<Vec<u8>>(v.clone()).ok())
+                    .unwrap_or_default(),
+                horizon_protocol::Format::Json => serde_json::to_vec(
+                    event_data.get("data").unwrap_or(&serde_json::Value::Null),
+                )
+                .unwrap_or_default(),
+            };
+
             // Create a GorcEvent from the client event data structure
             let gorc_event = GorcEvent {
                 object_id: event_data.get("object_id")
@@ -606,14 +622,12 @@ impl EventSystem {
                 channel: event_data.get("channel")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as u8,
-                data: serde_json::to_vec(
-                    event_data.get("data")
-                        .unwrap_or(&serde_json::Value::Null)
-                ).unwrap_or_default(),
+                data,
                 priority: "Normal".to_string(),
                 timestamp: event_data.get("timestamp")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(crate::utils::current_timestamp()),
+                format,
             };
 
             // Create client connection ref
@@ -631,6 +645,7 @@ impl EventSystem {
                         crate::types::AuthenticationStatus::default(),
                         sender.clone(),
                     )
+                    .with_format(format)
                 },
                 None => {
                     error!("❌ Client response sender not configured for GORC client handler");

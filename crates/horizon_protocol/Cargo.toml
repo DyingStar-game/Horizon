@@ -1,0 +1,18 @@
+[package]
+name = "horizon_protocol"
+version = "0.1.0"
+description = "Wire protocol between Horizon and its clients: frame types, JSON envelopes and bitcode encoding."
+license = "MIT"
+edition = "2021"
+
+[features]
+# Serialize bitcode frames to JSON, for logs and captures.
+debug-json = []
+
+[dependencies]
+# Pinned exactly in the workspace: an upgrade is a protocol version bump.
+bitcode = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
