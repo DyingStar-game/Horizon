@@ -9,6 +9,7 @@ use crate::{
     connection::{ConnectionManager, GameServerResponseSender},
     error::ServerError,
     server::handlers::{handle_connection, ListenerSettings},
+    connection::ListenerCompression,
 };
 use plugin_system::PluginManager;
 use futures::stream::{FuturesUnordered, StreamExt as FuturesStreamExt};
@@ -220,6 +221,29 @@ impl GameServer {
         self.start_internal(None).await
     }
 
+    /// The WebSocket listener's compression, with its dictionary loaded.
+    fn websocket_compression(&self) -> Result<horizon_event_system::protocol::Compression, ServerError> {
+        use horizon_event_system::protocol::{Compression, Dictionary};
+        let settings = &self.config.compression;
+        let dictionary = match &settings.dictionary_path {
+            Some(path) if self.config.websocket.compression != horizon_event_system::protocol::Codec::None => {
+                let bytes = std::fs::read(path).map_err(|e| {
+                    ServerError::Internal(format!("Cannot read compression dictionary {}: {e}", path.display()))
+                })?;
+                let dictionary = Dictionary::new(bytes);
+                info!("📚 Compression dictionary {} ({})", dictionary.id(), path.display());
+                Some(dictionary)
+            }
+            _ => None,
+        };
+        Ok(Compression {
+            codec: self.config.websocket.compression,
+            level: settings.level,
+            min_size: settings.min_size,
+            dictionary,
+        })
+    }
+
     /// Internal method for starting the server with optional shutdown state.
     async fn start_internal(&self, shutdown_state: Option<ShutdownState>) -> Result<(), ServerError> {
         info!("🚀 Starting game server on {}", self.config.bind_address);
@@ -350,15 +374,24 @@ impl GameServer {
         let mut shutdown_receiver = self.shutdown_sender.subscribe();
 
         // Create futures for all accept loops with shutdown monitoring
+        let compression = self.websocket_compression()?;
         let listener_settings = ListenerSettings {
-            profile: ListenerProfile::new(Transport::WebSocket).with_format(self.config.websocket.protocol),
+            profile: ListenerProfile::new(Transport::WebSocket)
+                .with_format(self.config.websocket.protocol)
+                .with_compression(self.config.websocket.compression),
             max_frame_size: self.config.security.max_message_size,
             max_decode_errors: self.config.security.max_decode_errors,
+            compression: Arc::new(ListenerCompression::new(compression)),
+            batch_delay: std::time::Duration::from_millis(self.config.compression.batch_delay_ms),
         };
-        info!("🔌 WebSocket listener speaks {}", self.config.websocket.protocol);
+        info!(
+            "🔌 WebSocket listener speaks {}, compression {}",
+            self.config.websocket.protocol, self.config.websocket.compression
+        );
         let mut accept_futures = listeners
             .into_iter()
             .map(|listener| {
+                let listener_settings = listener_settings.clone();
                 let connection_manager = self.connection_manager.clone();
                 let horizon_event_system = self.horizon_event_system.clone();
                 let shutdown_state_clone = shutdown_state.clone();
@@ -377,6 +410,7 @@ impl GameServer {
                             Ok((stream, addr)) => {
                                 let connection_manager = connection_manager.clone();
                                 let horizon_event_system = horizon_event_system.clone();
+                                let listener_settings = listener_settings.clone();
 
                                 // Spawn individual connection handler
                                 tokio::spawn(async move {

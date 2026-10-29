@@ -9,7 +9,7 @@
 //!   a supported protocol version.
 
 use crate::{
-    connection::{ConnectionId, ConnectionManager},
+    connection::{ConnectionId, ConnectionManager, ListenerCompression},
     error::ServerError,
     messaging::ClientMessage,
 };
@@ -19,6 +19,7 @@ use horizon_event_system::{
     ClientConnectionRef, EventSystem, Format, GorcObjectId, ListenerProfile, Outbound, PlayerId,
     RawClientMessageEvent,
 };
+use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
 /// What the router keeps about one connection between frames.
@@ -36,6 +37,8 @@ pub struct Session {
     pub handshake_done: bool,
     /// Undecodable frames received so far.
     pub decode_errors: u32,
+    /// The listener's compression.
+    pub compression: Arc<ListenerCompression>,
 }
 
 impl Session {
@@ -48,7 +51,27 @@ impl Session {
             max_decode_errors,
             handshake_done: false,
             decode_errors: 0,
+            compression: Arc::new(ListenerCompression::none()),
         }
+    }
+
+    /// The same session on a listener with compression.
+    pub fn with_compression(mut self, compression: Arc<ListenerCompression>) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Checks the dictionary a client announces against the server's. A client may
+    /// have one the server does not use; the reverse means it cannot read frames
+    /// compressed with the dictionary.
+    fn dictionary_mismatch(&self, client: Option<u32>) -> Option<Routed> {
+        let server = self.compression.settings().dictionary_id()?;
+        (client != Some(server)).then(|| {
+            Routed::Close(
+                CloseCode::DictionaryMismatch,
+                format!("the server compresses with dictionary {server}, the client has {client:?}"),
+            )
+        })
     }
 
     /// Counts an undecodable frame; returns the close code once there are too many.
@@ -94,9 +117,21 @@ pub async fn route_client_frame(
     if bytes.len() > session.max_frame_size {
         return Routed::Close(CloseCode::MessageTooLarge, CloseCode::MessageTooLarge.default_reason().to_string());
     }
+    // The header byte, then the body decompressed to at most max_frame_size bytes.
+    let body = match session.compression.settings().unwrap(bytes, session.max_frame_size) {
+        Ok(body) => body,
+        Err(protocol::ProtocolError::TooLarge { .. }) => {
+            return Routed::Close(CloseCode::MessageTooLarge, CloseCode::MessageTooLarge.default_reason().to_string());
+        }
+        Err(e) if !session.handshake_done => {
+            debug!("Connection {}: first frame has no valid header: {}", session.connection_id, e);
+            return Routed::Close(CloseCode::SettingsMismatch, format!("invalid frame header: {e}"));
+        }
+        Err(e) => return session.decode_error(e).into(),
+    };
     match session.profile.format {
-        Format::Json => route_json(bytes, session, connection_manager, horizon_event_system).await,
-        Format::Bitcode => route_bitcode(bytes, session, connection_manager, horizon_event_system).await,
+        Format::Json => route_json(&body, session, connection_manager, horizon_event_system).await,
+        Format::Bitcode => route_bitcode(&body, session, connection_manager, horizon_event_system).await,
     }
 }
 
@@ -138,14 +173,18 @@ fn json_hello(
     if hello.protocol_version != PROTOCOL_VERSION {
         return protocol_mismatch(hello.protocol_version);
     }
+    if let Some(close) = session.dictionary_mismatch(hello.dictionary_id) {
+        return close;
+    }
     session.handshake_done = true;
     let _ = horizon_event_system.event_table().snapshot();
+    let compression = session.compression.settings();
     let ack = json::HelloAck {
         kind: json::HelloAck::TYPE,
         protocol_version: PROTOCOL_VERSION,
         format: Format::Json.as_str(),
-        compression: "none",
-        dictionary_id: None,
+        compression: compression.codec.as_str(),
+        dictionary_id: compression.dictionary_id(),
     };
     match serde_json::to_vec(&ack) {
         Ok(bytes) => {
@@ -276,18 +315,22 @@ async fn route_bitcode(
     };
 
     if !session.handshake_done {
-        let ClientFrame::Hello { protocol_version, client, .. } = frame else {
+        let ClientFrame::Hello { protocol_version, client, dictionary_id } = frame else {
             return Routed::Close(CloseCode::ProtocolMismatch, "the first frame must be Hello".to_string());
         };
         if protocol_version != PROTOCOL_VERSION {
             return protocol_mismatch(protocol_version);
         }
+        if let Some(close) = session.dictionary_mismatch(dictionary_id) {
+            return close;
+        }
         debug!("Connection {}: bitcode client '{}'", session.connection_id, client);
         session.handshake_done = true;
+        let compression = session.compression.settings();
         let ack = ServerFrame::HelloAck {
             protocol_version: PROTOCOL_VERSION,
-            codec: 0,
-            dictionary_id: None,
+            codec: compression.codec.bits(),
+            dictionary_id: compression.dictionary_id(),
             event_table: horizon_event_system.event_table().snapshot(),
         };
         connection_manager.send_frame(session.connection_id, Outbound::reliable(protocol::encode_server(&ack)));

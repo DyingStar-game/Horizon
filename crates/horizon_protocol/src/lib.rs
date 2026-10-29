@@ -15,13 +15,17 @@
 //! manifest). The client says which version it speaks in [`ClientFrame::Hello`].
 
 pub mod close;
+pub mod compression;
 pub mod event_table;
 pub mod frame;
 pub mod json;
 pub mod payload;
+#[doc(hidden)]
+pub mod samples;
 
 pub use bitcode;
 pub use close::CloseCode;
+pub use compression::{Codec, Compression, Dictionary};
 pub use event_table::EventTable;
 pub use frame::{decode_client, decode_server, encode_client, encode_server, ClientFrame, EventKey, ServerFrame};
 
@@ -73,6 +77,21 @@ impl std::fmt::Display for Format {
     }
 }
 
+thread_local! {
+    /// bitcode sets up per-type encoder state on every call; a buffer reused per
+    /// thread keeps it, which makes encoding small frames several times cheaper.
+    static BITCODE_BUFFER: std::cell::RefCell<bitcode::Buffer> = std::cell::RefCell::new(bitcode::Buffer::new());
+}
+
+/// Encodes with the bitcode derive, reusing this thread's buffer.
+pub(crate) fn bitcode_encode<T: bitcode::Encode + ?Sized>(value: &T) -> Vec<u8> {
+    BITCODE_BUFFER.with(|buffer| match buffer.try_borrow_mut() {
+        Ok(mut buffer) => buffer.encode(value).to_vec(),
+        // Re-entered (an encoder calling back into us): no reuse this time.
+        Err(_) => bitcode::encode(value),
+    })
+}
+
 /// Why a frame could not be read or written.
 #[derive(Debug, thiserror::Error)]
 pub enum ProtocolError {
@@ -95,4 +114,11 @@ pub enum ProtocolError {
     /// `serde_json::Value`, untagged enums, flattened fields...): it is JSON-only.
     #[error("{0} cannot be encoded with bitcode's serde mode; send it to JSON clients or derive bitcode")]
     NotBitcodeCompatible(&'static str),
+    /// The frame's header byte is missing or invalid (unknown codec, reserved bits, a
+    /// dictionary the receiver does not have).
+    #[error("invalid frame header {0:?}")]
+    BadHeader(Option<u8>),
+    /// The compressed body could not be decompressed.
+    #[error("decompression failed: {0}")]
+    Decompression(String),
 }

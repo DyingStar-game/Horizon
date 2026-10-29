@@ -15,7 +15,13 @@ pub struct ReplicationLayer {
     pub frequency: f64,
     /// Properties to replicate at this layer
     pub properties: Vec<String>,
-    /// Compression type for this layer
+    /// Compression type for this layer.
+    ///
+    /// Has no effect on the wire: it only feeds [`estimated_compression_ratio`]. Frames
+    /// are compressed per listener (`[server.websocket] compression`), which supersedes
+    /// this field; it will be removed.
+    ///
+    /// [`estimated_compression_ratio`]: ReplicationLayer::estimated_compression_ratio
     pub compression: CompressionType,
     /// Priority level for this layer
     pub priority: ReplicationPriority,

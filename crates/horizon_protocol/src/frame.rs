@@ -111,12 +111,12 @@ impl ServerFrame {
 
 /// Encodes a server frame.
 pub fn encode_server(frame: &ServerFrame) -> bytes::Bytes {
-    bytes::Bytes::from(bitcode::encode(frame))
+    bytes::Bytes::from(crate::bitcode_encode(frame))
 }
 
 /// Encodes a client frame.
 pub fn encode_client(frame: &ClientFrame) -> Vec<u8> {
-    bitcode::encode(frame)
+    crate::bitcode_encode(frame)
 }
 
 /// Decodes a frame from an untrusted client, rejecting frames over `max_size` bytes

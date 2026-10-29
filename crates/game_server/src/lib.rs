@@ -119,3 +119,5 @@ mod auth_integration_tests;
 mod ws_tests;
 #[cfg(test)]
 mod ws_bitcode_tests;
+#[cfg(test)]
+mod ws_compression_tests;

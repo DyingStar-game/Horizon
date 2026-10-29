@@ -37,6 +37,23 @@ pub const MAX_BACKLOG_BYTES: usize = 256 * 1024 * 1024;
 /// Frames the fast-path channel holds before frames go to the backlog.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
+/// A frame waiting in an outbox.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Queued {
+    /// The frame.
+    pub frame: Outbound,
+    /// Whether the frame is ready for the wire as is (on a listener with compression:
+    /// header byte added, compressed if large). Unwrapped frames are grouped and
+    /// wrapped by the writer.
+    pub wrapped: bool,
+}
+
+impl Queued {
+    fn len(&self) -> usize {
+        self.frame.len()
+    }
+}
+
 /// A request for the connection's writer that skips the frame queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Control {
@@ -48,7 +65,7 @@ pub enum Control {
 
 #[derive(Debug, Default)]
 struct Backlog {
-    queue: VecDeque<Outbound>,
+    queue: VecDeque<Queued>,
     bytes: usize,
     /// When the backlog last went from empty to not empty.
     since: Option<Instant>,
@@ -96,7 +113,7 @@ impl Pushed {
 /// Sending half, one per connection (cloned freely).
 #[derive(Debug, Clone)]
 pub struct Outbox {
-    tx: mpsc::Sender<Outbound>,
+    tx: mpsc::Sender<Queued>,
     control: mpsc::UnboundedSender<Control>,
     shared: Arc<Shared>,
 }
@@ -104,7 +121,7 @@ pub struct Outbox {
 /// Receiving half, owned by the connection's writer.
 #[derive(Debug)]
 pub struct OutboxReceiver {
-    rx: mpsc::Receiver<Outbound>,
+    rx: mpsc::Receiver<Queued>,
     control: mpsc::UnboundedReceiver<Control>,
     shared: Arc<Shared>,
 }
@@ -134,7 +151,7 @@ pub enum Next {
     /// Write this control item first.
     Control(Control),
     /// Write this frame.
-    Frame(Outbound),
+    Frame(Queued),
     /// The connection was cut for being too slow.
     Cut,
     /// Every sender is gone.
@@ -157,8 +174,17 @@ pub fn outbox(connection_id: ConnectionId, capacity: usize) -> (Outbox, OutboxRe
 }
 
 impl Outbox {
-    /// Queue `frame` for the client without waiting.
+    /// Queue `frame` for the client without waiting; the writer wraps it for the wire.
     pub fn push(&self, frame: Outbound) -> Pushed {
+        self.push_queued(Queued { frame, wrapped: false })
+    }
+
+    /// Queue a frame already wrapped for the wire.
+    pub fn push_wrapped(&self, frame: Outbound) -> Pushed {
+        self.push_queued(Queued { frame, wrapped: true })
+    }
+
+    fn push_queued(&self, frame: Queued) -> Pushed {
         let mut backlog = self.shared.backlog();
         if backlog.cut {
             return Pushed::Cut;
@@ -254,7 +280,7 @@ impl OutboxReceiver {
 
     /// The next frame if one is ready now, for the writer to batch what is already
     /// queued into one flush. Control items are not returned here.
-    pub fn try_next_frame(&mut self) -> Option<Outbound> {
+    pub fn try_next_frame(&mut self) -> Option<Queued> {
         match self.try_frame()? {
             Next::Frame(frame) => Some(frame),
             _ => None,
@@ -284,7 +310,7 @@ impl OutboxReceiver {
         self.shared.backlog().cut
     }
 
-    fn pop_backlog(&self) -> Option<Outbound> {
+    fn pop_backlog(&self) -> Option<Queued> {
         let mut backlog = self.shared.backlog();
         let frame = backlog.queue.pop_front()?;
         backlog.bytes -= frame.len();
@@ -313,7 +339,7 @@ mod tests {
 
     async fn next_frame(rx: &mut OutboxReceiver) -> Option<Outbound> {
         match rx.next().await {
-            Next::Frame(frame) => Some(frame),
+            Next::Frame(queued) => Some(queued.frame),
             _ => None,
         }
     }
@@ -352,12 +378,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wrapped_frames_keep_their_flag() {
+        let (tx, mut rx) = outbox(1, 4);
+        tx.push(frame(0));
+        tx.push_wrapped(frame(1));
+        assert_eq!(rx.try_next_frame(), Some(Queued { frame: frame(0), wrapped: false }));
+        assert_eq!(rx.try_next_frame(), Some(Queued { frame: frame(1), wrapped: true }));
+    }
+
+    #[tokio::test]
     async fn try_next_frame_drains_what_is_ready() {
         let (tx, mut rx) = outbox(1, 2);
         for i in 0..5 {
             tx.push(frame(i));
         }
-        let drained: Vec<Outbound> = std::iter::from_fn(|| rx.try_next_frame()).collect();
+        let drained: Vec<Outbound> = std::iter::from_fn(|| rx.try_next_frame()).map(|q| q.frame).collect();
         assert_eq!(drained, (0..5).map(frame).collect::<Vec<_>>());
         assert_eq!(rx.try_next_frame(), None);
     }

@@ -35,6 +35,8 @@ base64 = "0.22"
 # protocol version bump (horizon_protocol::PROTOCOL_VERSION). Plugins deriving bitcode
 # must use this same version.
 bitcode = { version = "=0.6.9", features = ["serde"] }
+lz4_flex = "0.11"
+zstd = "0.13"
 flate2 = "1.0"
 
 # === Error Handling ===
