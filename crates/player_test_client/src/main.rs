@@ -10,7 +10,7 @@
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use horizon_event_system::{PlayerId, Vec3, GorcObjectId, Format};
-use horizon_event_system::protocol::{self, ClientFrame, EventKey, ServerFrame, PROTOCOL_VERSION};
+use horizon_event_system::protocol::{self, ClientFrame, Codec, Compression, EventKey, ServerFrame, PROTOCOL_VERSION};
 use plugin_player::events::{PlayerMoveRequest, PlayerAttackRequest, PlayerChatRequest};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,19 @@ struct Args {
     /// Message format of the server's listener: json or bitcode
     #[arg(long, default_value = "json", value_parser = parse_format)]
     format: Format,
+
+    /// Compression of the server's listener: none, zstd or lz4 (bitcode format only)
+    #[arg(long, default_value = "none", value_parser = parse_codec)]
+    compression: Codec,
+}
+
+fn parse_codec(value: &str) -> Result<Codec, String> {
+    match value {
+        "none" => Ok(Codec::None),
+        "zstd" => Ok(Codec::Zstd),
+        "lz4" => Ok(Codec::Lz4),
+        other => Err(format!("unknown compression '{other}' (none, zstd or lz4)")),
+    }
 }
 
 fn parse_format(value: &str) -> Result<Format, String> {
@@ -771,12 +784,13 @@ async fn simulate_player_bitcode(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (ws_stream, _) = connect_async(&ws_url).await?;
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let compression = Compression::with_codec(args.compression);
     let hello = ClientFrame::Hello {
         protocol_version: PROTOCOL_VERSION,
         client: "player_test_client".into(),
         dictionary_id: None,
     };
-    ws_sender.send(Message::Binary(protocol::encode_client(&hello))).await?;
+    ws_sender.send(Message::Binary(compression.wrap(&protocol::encode_client(&hello)).to_vec())).await?;
 
     let mut player = SimulatedPlayer::new(player_id, spawn_position);
     let mut own_handle: Option<u32> = None;
@@ -802,7 +816,13 @@ async fn simulate_player_bitcode(
                     None => break,
                 };
                 stats.bytes += bytes.len();
-                match protocol::decode_server(&bytes, usize::MAX)? {
+                let body = compression.unwrap(&bytes, usize::MAX)?;
+                let frames = match protocol::decode_server(&body, usize::MAX)? {
+                    ServerFrame::Batch { frames } => ServerFrame::unbatch(&frames)?,
+                    frame => vec![frame],
+                };
+                for frame in frames {
+                match frame {
                     ServerFrame::HelloAck { event_table, .. } => {
                         if let Some((id, _)) = event_table.iter().find(|(_, name)| name == "move") {
                             move_event = EventKey::Id(*id);
@@ -820,9 +840,9 @@ async fn simulate_player_bitcode(
                     ServerFrame::Event { .. } => stats.events += 1,
                     ServerFrame::Disconnect { code, reason } => {
                         warn!("Player {} disconnected: {} {}", player_id, code, reason);
-                        break;
                     }
                     _ => {}
+                }
                 }
             }
             _ = move_timer.tick() => {
@@ -840,7 +860,7 @@ async fn simulate_player_bitcode(
                 };
                 let payload = protocol::payload::encode_serde(Format::Bitcode, &request)?;
                 let frame = ClientFrame::GorcEvent { handle, channel: 0, event: move_event.clone(), payload };
-                ws_sender.send(Message::Binary(protocol::encode_client(&frame))).await?;
+                ws_sender.send(Message::Binary(compression.wrap(&protocol::encode_client(&frame)).to_vec())).await?;
                 sent += 1;
             }
         }
@@ -913,6 +933,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             log_messages: args.log_messages,
             log_file: args.log_file.clone(),
             format: args.format,
+            compression: args.compression,
         };
         
         let logger_clone = message_logger.clone();
