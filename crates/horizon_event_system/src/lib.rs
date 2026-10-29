@@ -188,7 +188,11 @@ pub use system::{
     HandlerCategoryStats,
     ClientConnectionRef,
     ClientResponseSender,
-    ClientConnectionInfo
+    ClientConnectionInfo,
+    Delivery,
+    ListenerProfile,
+    Outbound,
+    Transport,
 };
 
 // Re-export GORC components for easy access

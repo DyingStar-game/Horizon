@@ -16,6 +16,8 @@ horizon_sockets = { workspace = true, default-features = false, features = ["mio
 horizon_sockets = { workspace = true }
 plugin_system = { workspace = true }
 futures-util = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
 horizon_bugs = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -29,3 +31,6 @@ tokio = { workspace = true }
 serde = { workspace = true }
 libc = { workspace = true }
 bug = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

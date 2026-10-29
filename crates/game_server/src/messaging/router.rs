@@ -63,11 +63,14 @@ use tracing::{debug, trace, warn};
 /// 
 /// The presence of `instance_uuid` in the data field determines GORC routing.
 pub async fn route_client_message(
-    text: &str,
+    bytes: &[u8],
     connection_id: ConnectionId,
     connection_manager: &crate::connection::ConnectionManager,
     horizon_event_system: &EventSystem,
 ) -> Result<(), ServerError> {
+    // JSON listeners accept the message in a text or a binary WebSocket frame alike.
+    let text = std::str::from_utf8(bytes)
+        .map_err(|e| ServerError::Network(format!("Message is not valid UTF-8: {e}")))?;
     // Check if this is a native GORC event format first
     if let Ok(parsed_json) = serde_json::from_str::<serde_json::Value>(text) {
         if let Some(msg_type) = parsed_json.get("type").and_then(|v| v.as_str()) {

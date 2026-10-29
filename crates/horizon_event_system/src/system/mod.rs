@@ -10,7 +10,10 @@ mod tests;
 mod path_router;
 
 // Re-export all public items from submodules
-pub use client::{ClientConnectionRef, ClientResponseSender, ClientConnectionInfo};
+pub use client::{
+    ClientConnectionRef, ClientResponseSender, ClientConnectionInfo, Delivery, ListenerProfile, Outbound,
+    Transport,
+};
 pub use core::EventSystem;
 pub use emitters::*;
 pub use handlers::*;

@@ -120,6 +120,112 @@ pub trait ClientResponseSender: std::fmt::Debug {
         // Default implementation returns None to maintain backwards compatibility
         Box::pin(async move { None::<ClientConnectionInfo> })
     }
+
+    /// Send an already encoded frame to a client, with its delivery class.
+    ///
+    /// The bytes are shared, so the same frame can be queued for many players without
+    /// copying it. The default implementation falls back to [`send_to_client`], which is
+    /// reliable; senders that know the transport override it.
+    ///
+    /// [`send_to_client`]: ClientResponseSender::send_to_client
+    fn send_frame(&self, player_id: PlayerId, frame: Outbound) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        self.send_to_client(player_id, frame.bytes.to_vec())
+    }
+
+    /// The listener a client is connected through, or `None` if unknown.
+    fn connection_profile(&self, _player_id: PlayerId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ListenerProfile>> + Send + '_>> {
+        Box::pin(async move { None })
+    }
+
+    /// The round-trip time measured by the transport, when it measures one.
+    fn connection_rtt(&self, _player_id: PlayerId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<std::time::Duration>> + Send + '_>> {
+        Box::pin(async move { None })
+    }
+
+    /// The largest frame that fits in one unreliable datagram, when the transport has them.
+    fn max_datagram_size(&self, _player_id: PlayerId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send + '_>> {
+        Box::pin(async move { None })
+    }
+}
+
+/// How a frame travels to the client.
+///
+/// Unreliable frames are "latest wins" data, such as positions: they may be dropped, and
+/// a transport without datagrams sends them reliably instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    /// Delivered once, in order.
+    #[default]
+    Reliable,
+    /// May be dropped or arrive out of order; a newer frame replaces it.
+    Unreliable,
+}
+
+/// An encoded frame queued for one client.
+///
+/// `bytes` is reference counted: cloning an `Outbound` to fan it out to many players does
+/// not copy the frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Outbound {
+    /// The frame as it goes on the wire.
+    pub bytes: bytes::Bytes,
+    /// How the frame should travel.
+    pub delivery: Delivery,
+}
+
+impl Outbound {
+    /// A frame delivered once, in order.
+    pub fn reliable(bytes: impl Into<bytes::Bytes>) -> Self {
+        Self { bytes: bytes.into(), delivery: Delivery::Reliable }
+    }
+
+    /// A frame that may be dropped and replaced by a newer one.
+    pub fn unreliable(bytes: impl Into<bytes::Bytes>) -> Self {
+        Self { bytes: bytes.into(), delivery: Delivery::Unreliable }
+    }
+
+    /// The frame's size on the wire, in bytes.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the frame is empty.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+/// The transport a listener accepts clients on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Transport {
+    /// WebSocket over TCP: every frame is reliable.
+    #[default]
+    WebSocket,
+    /// WebTransport over QUIC: reliable streams and unreliable datagrams.
+    WebTransport,
+}
+
+/// What a client's listener is configured for. New settings are added as fields, so
+/// the struct is non-exhaustive: read its fields, build it with [`ListenerProfile::new`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub struct ListenerProfile {
+    /// The transport the client is connected through.
+    pub transport: Transport,
+}
+
+impl ListenerProfile {
+    /// A profile for the given transport, every other setting at its default.
+    pub fn new(transport: Transport) -> Self {
+        Self { transport }
+    }
+
+    /// Whether unreliable frames can travel as datagrams on this listener.
+    pub fn has_datagrams(&self) -> bool {
+        self.transport == Transport::WebTransport
+    }
 }
 
 /// Information about a client connection
