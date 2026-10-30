@@ -107,6 +107,8 @@ fn create_test_event_system() -> Arc<EventSystem> {
     Arc::new(events)
 }
 
+// Covers the deprecated complete-system API until it is removed.
+#[allow(deprecated)]
 #[tokio::test]
 async fn test_complete_system_integration() {
     let server_context = Arc::new(MockServerContext::new());

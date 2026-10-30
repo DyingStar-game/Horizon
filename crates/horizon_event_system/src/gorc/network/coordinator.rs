@@ -1,3 +1,5 @@
+// The deprecated GORC network path is still implemented here until it is removed.
+#![allow(deprecated)]
 /// Replication coordination and scheduling
 use super::types::{NetworkError, ReplicationStats, ReplicationUpdate};
 use crate::gorc::channels::{ReplicationPriority, CompressionType, ReplicationLayer};
@@ -11,6 +13,7 @@ use tokio::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 /// High-level coordinator that manages the entire replication system
+#[deprecated(since = "0.27.0", note = "never reaches clients: it sends through ServerContext::send_to_player, which the plugin system does not implement (BasicServerContext only logs a warning). Client replication goes through EventSystem::emit_gorc_instance* and the server listeners, with their formats, compression and delivery classes. Create the event system with EventSystem::with_gorc(GorcInstanceManager) instead. This will be removed.")]
 #[derive(Debug, Clone)]
 pub struct ReplicationCoordinator {
     /// Network engine for transmission

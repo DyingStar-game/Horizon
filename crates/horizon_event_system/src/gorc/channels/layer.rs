@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 
 /// Configuration for a replication layer within a channel
+#[allow(deprecated)] // derives touch the deprecated compression field
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationLayer {
     /// Channel number (0-3)
@@ -22,6 +23,11 @@ pub struct ReplicationLayer {
     /// this field; it will be removed.
     ///
     /// [`estimated_compression_ratio`]: ReplicationLayer::estimated_compression_ratio
+    #[deprecated(
+        since = "0.27.0",
+        note = "has no effect on the wire: compression is a listener setting ([server.websocket] / [server.webtransport] compression). This field will be removed; ReplicationLayer::new keeps its parameter."
+    )]
+    #[serde(default)]
     pub compression: CompressionType,
     /// Priority level for this layer
     pub priority: ReplicationPriority,
@@ -31,6 +37,7 @@ pub struct ReplicationLayer {
     pub delivery: crate::Delivery,
 }
 
+#[allow(deprecated)] // the deprecated compression field
 impl ReplicationLayer {
     /// Creates a new replication layer
     pub fn new(
@@ -216,5 +223,27 @@ impl ReplicationLayers {
         ));
         
         layers
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layers_without_compression_still_deserialize() {
+        let layer: ReplicationLayer = serde_json::from_str(
+            r#"{"channel":0,"radius":50.0,"frequency":30.0,"properties":["position"],"priority":"Critical"}"#,
+        )
+        .unwrap();
+        assert_eq!(layer.channel, 0);
+        assert_eq!(layer.delivery, crate::Delivery::Reliable);
+    }
+
+    #[test]
+    fn new_keeps_its_signature() {
+        let layer = ReplicationLayer::new(1, 10.0, 5.0, vec![], CompressionType::Lz4)
+            .with_delivery(crate::Delivery::Unreliable);
+        assert_eq!(layer.priority, ReplicationPriority::High);
+        assert_eq!(layer.delivery, crate::Delivery::Unreliable);
     }
 }
