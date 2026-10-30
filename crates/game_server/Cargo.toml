@@ -17,6 +17,9 @@ horizon_sockets = { workspace = true }
 plugin_system = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
+wtransport = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 dashmap = { workspace = true }
 horizon_bugs = { workspace = true }
 serde_json = { workspace = true }
@@ -34,3 +37,4 @@ bug = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+toml = { workspace = true }

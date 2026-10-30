@@ -82,6 +82,26 @@ impl ClientResponseSender for GameServerResponseSender {
         Box::pin(async move { result })
     }
 
+    /// The round-trip time measured by the player's transport (WebTransport only).
+    fn connection_rtt(&self, player_id: PlayerId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<std::time::Duration>> + Send + '_>> {
+        let rtt = self
+            .connection_manager
+            .connection_of(player_id)
+            .and_then(|connection_id| self.connection_manager.transport_info(connection_id))
+            .and_then(|info| info.rtt());
+        Box::pin(async move { rtt })
+    }
+
+    /// The largest datagram the player's connection takes (WebTransport only).
+    fn max_datagram_size(&self, player_id: PlayerId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send + '_>> {
+        let size = self
+            .connection_manager
+            .connection_of(player_id)
+            .and_then(|connection_id| self.connection_manager.transport_info(connection_id))
+            .and_then(|info| info.max_datagram_size());
+        Box::pin(async move { size })
+    }
+
     /// The listener the player is connected through.
     fn connection_profile(&self, player_id: PlayerId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ListenerProfile>> + Send + '_>> {
         let profile = self

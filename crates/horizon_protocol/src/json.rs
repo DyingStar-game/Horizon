@@ -98,6 +98,21 @@ impl Batch {
     }
 }
 
+/// The server is closing the connection (WebTransport, where the transport close
+/// carries no reason a JSON client can read): `{"type":"disconnect","code":4005,...}`.
+#[derive(Debug, Serialize)]
+pub struct Disconnect<'a> {
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub code: u16,
+    pub reason: &'a str,
+}
+
+impl<'a> Disconnect<'a> {
+    /// The `type` value of a disconnect notice.
+    pub const TYPE: &'static str = "disconnect";
+}
+
 /// Optional handshake of a JSON client: `{"type":"hello","protocol_version":1,...}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hello {

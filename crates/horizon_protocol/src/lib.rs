@@ -22,6 +22,7 @@ pub mod json;
 pub mod payload;
 #[doc(hidden)]
 pub mod samples;
+pub mod stream;
 
 pub use bitcode;
 pub use close::CloseCode;
