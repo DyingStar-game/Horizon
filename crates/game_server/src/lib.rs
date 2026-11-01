@@ -95,7 +95,7 @@
 // Re-export core types and functions for easy access
 pub use config::ServerConfig;
 pub use error::ServerError;
-pub use server::GameServer;
+pub use server::{DeliveryCounters, GameServer};
 pub use utils::{create_server, create_server_with_config};
 
 // Public module declarations
@@ -109,9 +109,18 @@ pub mod atlas_client;
 
 // Internal modules (not part of public API)
 mod connection;
+pub mod transport;
 mod messaging;
 mod tests;
 
 // Authentication integration tests
 #[cfg(test)]
 mod auth_integration_tests;
+#[cfg(test)]
+mod ws_tests;
+#[cfg(test)]
+mod ws_bitcode_tests;
+#[cfg(test)]
+mod ws_compression_tests;
+#[cfg(test)]
+mod webtransport_tests;

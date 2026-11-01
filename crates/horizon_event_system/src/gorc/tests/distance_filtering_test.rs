@@ -194,11 +194,12 @@ async fn test_distance_filtering_after_movement() {
     gorc_instances.add_player(player1_id, Vec3::new(0.0, 0.0, 0.0)).await;
     gorc_instances.add_player(player2_id, Vec3::new(0.0, 0.0, 0.0)).await;
     
-    // CRITICAL: Trigger subscription calculation for both players
-    event_system.update_player_position(player1_id, Vec3::new(0.0, 0.0, 0.0)).await
-        .expect("Failed to update player 1 position");
-    event_system.update_player_position(player2_id, Vec3::new(0.0, 0.0, 0.0)).await
-        .expect("Failed to update player 2 position");
+    // Subscribe both players to the objects already in range: add_player records the
+    // position, so a zero-distance update_player_position no longer sweeps the zones.
+    event_system.subscribe_player_to_existing_objects(player1_id, Vec3::new(0.0, 0.0, 0.0)).await
+        .expect("Failed to subscribe player 1");
+    event_system.subscribe_player_to_existing_objects(player2_id, Vec3::new(0.0, 0.0, 0.0)).await
+        .expect("Failed to subscribe player 2");
     
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     
@@ -323,11 +324,12 @@ async fn test_distance_filtering_with_multiple_movements() {
     gorc_instances.add_player(player1_id, Vec3::new(0.0, 0.0, 0.0)).await;
     gorc_instances.add_player(player2_id, Vec3::new(0.0, 0.0, 0.0)).await;
     
-    // CRITICAL: Trigger subscription calculation for both players
-    event_system.update_player_position(player1_id, Vec3::new(0.0, 0.0, 0.0)).await
-        .expect("Failed to update player 1 position");
-    event_system.update_player_position(player2_id, Vec3::new(0.0, 0.0, 0.0)).await
-        .expect("Failed to update player 2 position");
+    // Subscribe both players to the objects already in range: add_player records the
+    // position, so a zero-distance update_player_position no longer sweeps the zones.
+    event_system.subscribe_player_to_existing_objects(player1_id, Vec3::new(0.0, 0.0, 0.0)).await
+        .expect("Failed to subscribe player 1");
+    event_system.subscribe_player_to_existing_objects(player2_id, Vec3::new(0.0, 0.0, 0.0)).await
+        .expect("Failed to subscribe player 2");
     
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     

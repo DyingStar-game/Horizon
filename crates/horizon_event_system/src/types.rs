@@ -362,6 +362,10 @@ pub enum DisconnectReason {
     ServerShutdown,
     /// An error occurred that forced disconnection
     Error(String),
+    /// The server kicked the player, with the reason given to the client
+    Kicked(String),
+    /// The client did not read its messages fast enough and its connection was cut
+    SlowClient,
 }
 
 /// Represents the authentication status of a player.
