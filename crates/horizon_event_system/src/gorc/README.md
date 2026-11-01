@@ -1,5 +1,14 @@
 # GORC (Game Object Replication Channels)
 
+> **Deprecated:** `create_complete_horizon_system`, `CompleteGorcSystem`, `NetworkReplicationEngine`
+> and `ReplicationCoordinator` (0.27.0). Their packets go through `ServerContext::send_to_player`,
+> which the plugin system does not implement, so they never reach clients. Clients receive GORC
+> replication through `EventSystem::emit_gorc_instance*` and the server's listeners (WebSocket or
+> WebTransport, JSON or bitcode, optional compression). Create the event system with
+> `EventSystem::with_gorc(GorcInstanceManager)`. `ReplicationLayer.compression` is deprecated too:
+> compression is a listener setting.
+
+
 GORC is an advanced replication system for multiplayer games that provides intelligent, zone-based object state distribution. Rather than broadcasting all object updates to all players, GORC creates dynamic subscription zones around each object instance, ensuring players receive exactly the information they need with optimal network efficiency.
 
 ## The Problem GORC Solves

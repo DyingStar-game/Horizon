@@ -159,6 +159,7 @@ pub mod utils;
 pub mod gorc;
 
 // Re-export commonly used items for convenience
+#[allow(deprecated)]
 pub use api::{create_complete_horizon_system, create_simple_horizon_system};
 pub use utils::{create_horizon_event_system, current_timestamp};
 pub use traits::{SimpleGorcObject, SimpleReplicationConfig};
@@ -200,6 +201,7 @@ pub use horizon_protocol as protocol;
 pub use horizon_protocol::Format;
 
 // Re-export GORC components for easy access
+#[allow(deprecated)]
 pub use gorc::{
     // Core GORC types
     GorcObject, GorcObjectId, ObjectInstance, GorcInstanceManager,

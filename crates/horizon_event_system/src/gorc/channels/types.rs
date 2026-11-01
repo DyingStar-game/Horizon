@@ -2,9 +2,10 @@
 use serde::{Deserialize, Serialize};
 
 /// Compression algorithms available for replication data
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CompressionType {
     /// No compression - fastest but largest payload
+    #[default]
     None,
     /// LZ4 compression - good balance of speed and size
     Lz4,
