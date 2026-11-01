@@ -41,6 +41,18 @@ pub struct ServerConfig {
     
     /// Plugin safety configuration settings
     pub plugin_safety: PluginSafetyConfig,
+
+    /// WebSocket listener settings
+    #[serde(default)]
+    pub websocket: WebSocketConfig,
+}
+
+/// Settings of the WebSocket listener.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WebSocketConfig {
+    /// Message format: today's JSON envelopes, or bitcode frames.
+    #[serde(default)]
+    pub protocol: horizon_event_system::Format,
 }
 
 /// Security configuration for input validation and protection
@@ -72,6 +84,10 @@ pub struct SecurityConfig {
     
     /// Maximum concurrent connections per IP
     pub max_connections_per_ip: u32,
+
+    /// Frames a client may send that cannot be decoded before it is disconnected
+    #[serde(default = "default_max_decode_errors")]
+    pub max_decode_errors: u32,
     
 }
 
@@ -94,8 +110,13 @@ impl Default for ServerConfig {
             tick_interval_ms: 50, // 20 ticks per second by default
             security: SecurityConfig::default(),
             plugin_safety: PluginSafetyConfig::default(),
+            websocket: WebSocketConfig::default(),
         }
     }
+}
+
+fn default_max_decode_errors() -> u32 {
+    5
 }
 
 impl Default for SecurityConfig {
@@ -110,6 +131,7 @@ impl Default for SecurityConfig {
             enable_ddos_protection: true,
             banned_ips: Vec::new(),
             max_connections_per_ip: 10,
+            max_decode_errors: default_max_decode_errors(),
         }
     }
 }

@@ -2,6 +2,7 @@
 use crate::events::EventError;
 use crate::types::{PlayerId, AuthenticationStatus};
 // use serde::{Deserialize, Serialize}; // Unused
+use horizon_protocol::{json, payload, EventKey, Format, ServerFrame};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -19,6 +20,8 @@ pub struct ClientConnectionRef {
     pub connected_at: u64,
     /// Current authentication status of the connection
     pub auth_status: AuthenticationStatus,
+    /// Message format of the client's listener
+    format: Format,
     /// Sender for direct response to this specific client
     response_sender: Arc<dyn ClientResponseSender + Send + Sync>,
 }
@@ -31,6 +34,7 @@ impl std::fmt::Debug for ClientConnectionRef {
             .field("connection_id", &self.connection_id)
             .field("connected_at", &self.connected_at)
             .field("auth_status", &self.auth_status)
+            .field("format", &self.format)
             .field("response_sender", &"[response_sender]")
             .finish()
     }
@@ -59,8 +63,20 @@ impl ClientConnectionRef {
             connection_id,
             connected_at,
             auth_status,
+            format: Format::Json,
             response_sender,
         }
+    }
+
+    /// The same connection, speaking `format`.
+    pub fn with_format(mut self, format: Format) -> Self {
+        self.format = format;
+        self
+    }
+
+    /// The message format of the client's listener.
+    pub fn format(&self) -> Format {
+        self.format
     }
 
     /// Gets the current authentication status of this connection
@@ -86,6 +102,39 @@ impl ClientConnectionRef {
         let json = serde_json::to_vec(data)
             .map_err(|e| EventError::HandlerExecution(format!("JSON serialization failed: {}", e)))?;
         self.respond(&json).await
+    }
+
+    /// Send a client event to this client, encoded in its listener's format: the
+    /// `{namespace, event, data}` envelope in JSON, a [`ServerFrame::Event`] in bitcode
+    /// (payload through serde).
+    ///
+    /// [`ServerFrame::Event`]: horizon_protocol::ServerFrame::Event
+    pub async fn respond_event<T: serde::Serialize>(&self, namespace: &str, event: &str, data: &T) -> Result<(), EventError> {
+        let frame = encode_event(self.format, namespace, event, data)?;
+        self.send_event_frame(frame).await
+    }
+
+    /// Like [`respond_event`](Self::respond_event), with the bitcode derive for bitcode
+    /// clients: for hot types.
+    pub async fn respond_event_packed<T>(&self, namespace: &str, event: &str, data: &T) -> Result<(), EventError>
+    where
+        T: serde::Serialize + horizon_protocol::bitcode::Encode,
+    {
+        let frame = match self.format {
+            Format::Json => encode_event(Format::Json, namespace, event, data)?,
+            Format::Bitcode => {
+                let payload = horizon_protocol::bitcode::encode(data);
+                event_frame_bitcode(namespace, event, payload)
+            }
+        };
+        self.send_event_frame(frame).await
+    }
+
+    async fn send_event_frame(&self, frame: bytes::Bytes) -> Result<(), EventError> {
+        self.response_sender
+            .send_frame(self.player_id, Outbound::reliable(frame))
+            .await
+            .map_err(|e| EventError::HandlerExecution(format!("Failed to send response: {}", e)))
     }
 
     /// Check if this connection is still active
@@ -214,12 +263,20 @@ pub enum Transport {
 pub struct ListenerProfile {
     /// The transport the client is connected through.
     pub transport: Transport,
+    /// The message format of the listener.
+    pub format: Format,
 }
 
 impl ListenerProfile {
     /// A profile for the given transport, every other setting at its default.
     pub fn new(transport: Transport) -> Self {
-        Self { transport }
+        Self { transport, format: Format::Json }
+    }
+
+    /// The same profile with another message format.
+    pub fn with_format(mut self, format: Format) -> Self {
+        self.format = format;
+        self
     }
 
     /// Whether unreliable frames can travel as datagrams on this listener.
@@ -236,4 +293,30 @@ pub struct ClientConnectionInfo {
     pub connection_id: String,
     pub connected_at: u64,
     pub auth_status: AuthenticationStatus,
+}
+/// A client event frame in `format`.
+pub(crate) fn encode_event<T: serde::Serialize + ?Sized>(
+    format: Format,
+    namespace: &str,
+    event: &str,
+    data: &T,
+) -> Result<bytes::Bytes, EventError> {
+    match format {
+        Format::Json => {
+            let envelope = json::Event { namespace, event, data };
+            Ok(bytes::Bytes::from(serde_json::to_vec(&envelope)?))
+        }
+        Format::Bitcode => {
+            let payload = payload::encode_serde(Format::Bitcode, data)
+                .map_err(|e| EventError::HandlerExecution(e.to_string()))?;
+            Ok(event_frame_bitcode(namespace, event, payload))
+        }
+    }
+}
+
+fn event_frame_bitcode(namespace: &str, event: &str, payload: Vec<u8>) -> bytes::Bytes {
+    horizon_protocol::encode_server(&ServerFrame::Event {
+        key: EventKey::Name(format!("{namespace}:{event}")),
+        payload,
+    })
 }

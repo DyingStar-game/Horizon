@@ -101,14 +101,9 @@ pub async fn handle_movement_request(
         ));
     }
     
-    // Parse the movement data from the GORC event payload
-    let event_data = serde_json::from_slice::<serde_json::Value>(&gorc_event.data)
-        .map_err(|e| {
-            error!("🚀 GORC: ❌ Failed to parse JSON from GORC event data: {}", e);
-            EventError::HandlerExecution("Invalid JSON in movement request".to_string())
-        })?;
-    
-    let move_data = serde_json::from_value::<PlayerMoveRequest>(event_data)
+    // Parse the movement data from the GORC event payload, in the client's format
+    // (JSON, or bitcode for clients on a bitcode listener)
+    let move_data = gorc_event.decode_data::<PlayerMoveRequest>()
         .map_err(|e| {
             error!("🚀 GORC: ❌ Failed to parse PlayerMoveRequest: {}", e);
             EventError::HandlerExecution("Invalid movement request format".to_string())

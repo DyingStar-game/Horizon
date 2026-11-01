@@ -8,6 +8,7 @@ mod stats;
 mod cache;
 mod tests;
 mod path_router;
+mod typed_client;
 
 // Re-export all public items from submodules
 pub use client::{

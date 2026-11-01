@@ -195,6 +195,10 @@ pub use system::{
     Transport,
 };
 
+// Wire protocol: formats, frames, JSON envelopes.
+pub use horizon_protocol as protocol;
+pub use horizon_protocol::Format;
+
 // Re-export GORC components for easy access
 pub use gorc::{
     // Core GORC types

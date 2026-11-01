@@ -33,6 +33,12 @@ pub struct EventSystem {
     pub(super) gorc_instances: Option<Arc<GorcInstanceManager>>,
     /// Client response sender for connection-aware handlers
     pub(super) client_response_sender: Option<Arc<dyn ClientResponseSender + Send + Sync>>,
+    /// Ids of the event names bitcode frames carry
+    pub(super) event_table: Arc<horizon_protocol::EventTable>,
+    /// Client event handlers that take the payload in the client's format
+    pub(super) typed_client_handlers: DashMap<String, Vec<super::typed_client::RawClientHandler>>,
+    /// Subscribers skipped by `emit_gorc_instance_bytes` because they use another format
+    pub(super) skipped_format_mismatch: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for EventSystem {
@@ -56,6 +62,9 @@ impl EventSystem {
             serialization_pool: SerializationBufferPool::default(),
             gorc_instances: None,
             client_response_sender: None,
+            event_table: Arc::new(horizon_protocol::EventTable::new()),
+            typed_client_handlers: DashMap::new(),
+            skipped_format_mismatch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -68,6 +77,9 @@ impl EventSystem {
             serialization_pool: SerializationBufferPool::default(),
             gorc_instances: Some(gorc_instances),
             client_response_sender: None,
+            event_table: Arc::new(horizon_protocol::EventTable::new()),
+            typed_client_handlers: DashMap::new(),
+            skipped_format_mismatch: std::sync::atomic::AtomicU64::new(0),
         }
     }
 

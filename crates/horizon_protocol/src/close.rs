@@ -1,12 +1,12 @@
 //! Close codes the server ends a client connection with.
 //!
 //! They sit in the 4000-4999 range, which WebSocket leaves to applications, so a client
-//! can tell why it was disconnected and whether reconnecting makes sense.
-
-use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode as WsCloseCode;
+//! can tell why it was disconnected and whether reconnecting makes sense. WebTransport
+//! sessions close with the same numbers.
 
 /// Why the server closed a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CloseCode {
     /// The client speaks a protocol version the server does not support.
     ProtocolMismatch,
@@ -78,12 +78,6 @@ impl CloseCode {
     }
 }
 
-impl From<CloseCode> for WsCloseCode {
-    fn from(code: CloseCode) -> Self {
-        WsCloseCode::from(code.code())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,11 +92,5 @@ mod tests {
             assert_eq!(CloseCode::from_code(code.code()), Some(code));
         }
         assert_eq!(CloseCode::from_code(1000), None);
-    }
-
-    #[test]
-    fn converts_to_a_websocket_close_code() {
-        let ws: WsCloseCode = CloseCode::Kicked.into();
-        assert_eq!(u16::from(ws), 4005);
     }
 }

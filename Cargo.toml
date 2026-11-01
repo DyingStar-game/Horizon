@@ -29,8 +29,12 @@ rayon = "1.7.0"
 # === Data Processing & Encoding ===
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.143"
+serde_json = { version = "1.0.143", features = ["raw_value"] }
 base64 = "0.22"
+# Exact pin: bitcode only guarantees its format within a version, so an upgrade is a
+# protocol version bump (horizon_protocol::PROTOCOL_VERSION). Plugins deriving bitcode
+# must use this same version.
+bitcode = { version = "=0.6.9", features = ["serde"] }
 flate2 = "1.0"
 
 # === Error Handling ===
@@ -63,6 +67,7 @@ Horizon-Network-Common = "0.2.0"
 # === Workspace Dependencies ===
 game_server = { path = "crates/game_server" }
 horizon = { path = "crates/horizon" }
+horizon_protocol = { path = "crates/horizon_protocol" }
 horizon_event_system = { path = "crates/horizon_event_system" }
 plugin_system = { path = "crates/plugin_system" }
 horizon_bugs = { path = "crates/horizon_bugs" }

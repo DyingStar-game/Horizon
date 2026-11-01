@@ -19,6 +19,10 @@ pub struct ReplicationLayer {
     pub compression: CompressionType,
     /// Priority level for this layer
     pub priority: ReplicationPriority,
+    /// How this layer's events travel to clients by default: unreliable layers are
+    /// "latest wins" data (transforms...) that may be dropped and arrive out of order.
+    #[serde(default)]
+    pub delivery: crate::Delivery,
 }
 
 impl ReplicationLayer {
@@ -45,7 +49,21 @@ impl ReplicationLayer {
             properties,
             compression,
             priority,
+            delivery: crate::Delivery::Reliable,
         }
+    }
+
+    /// The same layer with another delivery class.
+    ///
+    /// ```
+    /// use horizon_event_system::{CompressionType, Delivery, ReplicationLayer};
+    /// let transforms = ReplicationLayer::new(0, 50.0, 30.0, vec!["position".into()], CompressionType::None)
+    ///     .with_delivery(Delivery::Unreliable);
+    /// assert_eq!(transforms.delivery, Delivery::Unreliable);
+    /// ```
+    pub fn with_delivery(mut self, delivery: crate::Delivery) -> Self {
+        self.delivery = delivery;
+        self
     }
 
     /// Get the update interval for this layer

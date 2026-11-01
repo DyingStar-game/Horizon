@@ -10,12 +10,12 @@ use crate::{
         CloseCode, ConnectionManager,
     },
     error::ServerError,
-    messaging::route_client_message,
+    messaging::{route_client_frame, Routed, Session},
 };
 use bytes::Bytes;
 use futures::{Sink, SinkExt, StreamExt};
 use horizon_event_system::{
-    current_timestamp, DisconnectReason, EventSystem, ListenerProfile, Outbound,
+    current_timestamp, DisconnectReason, EventSystem, Format, ListenerProfile, Outbound,
     PlayerConnectedEvent, PlayerDisconnectedEvent, PlayerId, Transport,
 };
 use std::net::SocketAddr;
@@ -25,7 +25,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
     accept_async,
-    tungstenite::{self, protocol::CloseFrame, Message, Utf8Bytes},
+    tungstenite::{self, protocol::{frame::coding::CloseCode as WsCloseCode, CloseFrame}, Message, Utf8Bytes},
     WebSocketStream,
 };
 use tracing::{debug, error, trace, warn};
@@ -35,6 +35,27 @@ const MAX_FRAMES_PER_FLUSH: usize = 256;
 
 /// How long the writer waits to deliver a close frame before giving up on the client.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What a listener accepts, applied to each of its connections.
+#[derive(Debug, Clone, Copy)]
+pub struct ListenerSettings {
+    /// Transport and message format.
+    pub profile: ListenerProfile,
+    /// Largest frame accepted from a client, in bytes.
+    pub max_frame_size: usize,
+    /// Undecodable frames tolerated before the connection is closed.
+    pub max_decode_errors: u32,
+}
+
+impl Default for ListenerSettings {
+    fn default() -> Self {
+        Self {
+            profile: ListenerProfile::new(Transport::WebSocket),
+            max_frame_size: horizon_event_system::protocol::DEFAULT_MAX_FRAME_SIZE,
+            max_decode_errors: 5,
+        }
+    }
+}
 
 /// Handles a single client connection from establishment to cleanup.
 ///
@@ -51,11 +72,12 @@ pub async fn handle_connection(
     addr: SocketAddr,
     connection_manager: Arc<ConnectionManager>,
     horizon_event_system: Arc<EventSystem>,
+    settings: ListenerSettings,
 ) -> Result<(), ServerError> {
     let ws_stream = accept_async(stream)
         .await
         .map_err(|e| ServerError::Network(format!("WebSocket handshake failed: {e}")))?;
-    serve_websocket(ws_stream, addr, connection_manager, horizon_event_system).await
+    serve_websocket(ws_stream, addr, connection_manager, horizon_event_system, settings).await
 }
 
 /// Why a connection ended, as seen by its handler.
@@ -95,12 +117,12 @@ pub(crate) async fn serve_websocket<S>(
     addr: SocketAddr,
     connection_manager: Arc<ConnectionManager>,
     horizon_event_system: Arc<EventSystem>,
+    settings: ListenerSettings,
 ) -> Result<(), ServerError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let profile = ListenerProfile::new(Transport::WebSocket);
-    let (connection_id, mut outbox) = connection_manager.open_connection(addr, profile).await;
+    let (connection_id, mut outbox) = connection_manager.open_connection(addr, settings.profile).await;
 
     // Generate player ID and emit connection event
     let player_id = PlayerId::new();
@@ -129,6 +151,13 @@ where
         let connection_manager = connection_manager.clone();
         let horizon_event_system = horizon_event_system.clone();
         async move {
+            let mut session = Session::new(
+                connection_id,
+                settings.profile,
+                settings.max_frame_size,
+                settings.max_decode_errors,
+            );
+            let mut closing = false;
             while let Some(msg) = ws_receiver.next().await {
                 let payload = match msg {
                     Ok(Message::Text(text)) => Bytes::from(text),
@@ -148,22 +177,25 @@ where
                         break;
                     }
                 };
-                if let Err(e) = route_client_message(
-                    &payload,
-                    connection_id,
-                    &connection_manager,
-                    &horizon_event_system,
-                )
-                .await
-                {
-                    trace!("❌ Message routing error: {}", e);
+                if closing {
+                    // The writer is sending the close frame; nothing more is routed.
+                    continue;
+                }
+                let routed =
+                    route_client_frame(&payload, &mut session, &connection_manager, &horizon_event_system).await;
+                if let Routed::Close(code, reason) = routed {
+                    trace!("Closing connection {}: {:?} ({})", connection_id, code, reason);
+                    closing = true;
+                    let _ = connection_manager.close_connection(connection_id, code, Some(reason));
                 }
             }
             Ended::ByClient
         }
     };
 
-    let outgoing_task = write_frames(&mut ws_sender, &mut outbox);
+    // JSON listeners send text frames, as they always have; every other format binary.
+    let text_frames = settings.profile.format == Format::Json;
+    let outgoing_task = write_frames(&mut ws_sender, &mut outbox, text_frames);
 
     // Run both tasks concurrently until one completes
     let ended = tokio::select! {
@@ -204,7 +236,7 @@ where
 /// Control items go first. Frames already queued are written together and flushed
 /// once. A write blocked on a client that stopped reading is abandoned as soon as the
 /// outbox cuts the connection.
-async fn write_frames<W>(sink: &mut W, outbox: &mut OutboxReceiver) -> Ended
+async fn write_frames<W>(sink: &mut W, outbox: &mut OutboxReceiver, text_frames: bool) -> Ended
 where
     W: Sink<Message, Error = tungstenite::Error> + Unpin,
 {
@@ -229,7 +261,7 @@ where
                     }
                 }
                 let written = tokio::select! {
-                    written = write_batch(sink, batch) => written,
+                    written = write_batch(sink, batch, text_frames) => written,
                     _ = cut.cut() => Err(None),
                 };
                 match written {
@@ -246,12 +278,13 @@ where
 
 /// Feeds every frame of `batch`, then flushes once. `Err(None)` is never returned here;
 /// it stands for "abandoned" in the caller.
-async fn write_batch<W>(sink: &mut W, batch: Vec<Outbound>) -> Result<(), Option<tungstenite::Error>>
+async fn write_batch<W>(sink: &mut W, batch: Vec<Outbound>, text_frames: bool) -> Result<(), Option<tungstenite::Error>>
 where
     W: Sink<Message, Error = tungstenite::Error> + Unpin,
 {
     for frame in batch {
-        sink.feed(frame_message(frame)).await.map_err(Some)?;
+        let message = if text_frames { frame_message(frame) } else { Message::Binary(frame.bytes) };
+        sink.feed(message).await.map_err(Some)?;
     }
     sink.flush().await.map_err(Some)
 }
@@ -272,14 +305,14 @@ where
     W: Sink<Message, Error = tungstenite::Error> + Unpin,
 {
     let frame = Message::Close(Some(CloseFrame {
-        code: code.into(),
+        code: WsCloseCode::from(code.code()),
         reason: Utf8Bytes::from(reason),
     }));
     let _ = tokio::time::timeout(CLOSE_TIMEOUT, sink.send(frame)).await;
 }
 
-/// The WebSocket message carrying a frame: text when it is valid UTF-8 (every JSON
-/// frame), binary otherwise. Before, every frame went through `from_utf8_lossy`, which
+/// The WebSocket message carrying a frame on a JSON listener: text when it is valid
+/// UTF-8 (every JSON frame), binary otherwise. Before, every frame went through `from_utf8_lossy`, which
 /// corrupted binary payloads.
 fn frame_message(frame: Outbound) -> Message {
     let bytes = frame.bytes;
