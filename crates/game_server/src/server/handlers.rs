@@ -7,7 +7,7 @@
 use crate::{
     connection::{
         outbox::{Control, Next, OutboxReceiver},
-        CloseCode, ConnectionManager,
+        CloseCode, ConnectionManager, ListenerCompression,
     },
     error::ServerError,
     messaging::{route_client_frame, Routed, Session},
@@ -37,14 +37,18 @@ const MAX_FRAMES_PER_FLUSH: usize = 256;
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// What a listener accepts, applied to each of its connections.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ListenerSettings {
-    /// Transport and message format.
+    /// Transport, message format and compression codec.
     pub profile: ListenerProfile,
-    /// Largest frame accepted from a client, in bytes.
+    /// Largest frame accepted from a client, in bytes (after decompression).
     pub max_frame_size: usize,
     /// Undecodable frames tolerated before the connection is closed.
     pub max_decode_errors: u32,
+    /// Compression settings, shared by the listener's connections.
+    pub compression: Arc<ListenerCompression>,
+    /// How long the writer waits for more small frames before compressing a batch.
+    pub batch_delay: Duration,
 }
 
 impl Default for ListenerSettings {
@@ -53,6 +57,8 @@ impl Default for ListenerSettings {
             profile: ListenerProfile::new(Transport::WebSocket),
             max_frame_size: horizon_event_system::protocol::DEFAULT_MAX_FRAME_SIZE,
             max_decode_errors: 5,
+            compression: Arc::new(ListenerCompression::none()),
+            batch_delay: Duration::ZERO,
         }
     }
 }
@@ -122,7 +128,9 @@ pub(crate) async fn serve_websocket<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let (connection_id, mut outbox) = connection_manager.open_connection(addr, settings.profile).await;
+    let (connection_id, mut outbox) = connection_manager
+        .open_connection_with(addr, settings.profile, settings.compression.clone())
+        .await;
 
     // Generate player ID and emit connection event
     let player_id = PlayerId::new();
@@ -150,13 +158,15 @@ where
     let incoming_task = {
         let connection_manager = connection_manager.clone();
         let horizon_event_system = horizon_event_system.clone();
+        let settings = settings.clone();
         async move {
             let mut session = Session::new(
                 connection_id,
                 settings.profile,
                 settings.max_frame_size,
                 settings.max_decode_errors,
-            );
+            )
+            .with_compression(settings.compression.clone());
             let mut closing = false;
             while let Some(msg) = ws_receiver.next().await {
                 let payload = match msg {
@@ -193,9 +203,15 @@ where
         }
     };
 
-    // JSON listeners send text frames, as they always have; every other format binary.
-    let text_frames = settings.profile.format == Format::Json;
-    let outgoing_task = write_frames(&mut ws_sender, &mut outbox, text_frames);
+    // JSON listeners without compression send text frames, as they always have; every
+    // other listener binary.
+    let wire = Wire {
+        text_frames: settings.profile.format == Format::Json && !settings.compression.has_header(),
+        format: settings.profile.format,
+        compression: settings.compression.clone(),
+        batch_delay: settings.batch_delay,
+    };
+    let outgoing_task = write_frames(&mut ws_sender, &mut outbox, &wire);
 
     // Run both tasks concurrently until one completes
     let ended = tokio::select! {
@@ -236,7 +252,15 @@ where
 /// Control items go first. Frames already queued are written together and flushed
 /// once. A write blocked on a client that stopped reading is abandoned as soon as the
 /// outbox cuts the connection.
-async fn write_frames<W>(sink: &mut W, outbox: &mut OutboxReceiver, text_frames: bool) -> Ended
+/// How a connection's frames go on the wire.
+struct Wire {
+    text_frames: bool,
+    format: Format,
+    compression: Arc<ListenerCompression>,
+    batch_delay: Duration,
+}
+
+async fn write_frames<W>(sink: &mut W, outbox: &mut OutboxReceiver, wire: &Wire) -> Ended
 where
     W: Sink<Message, Error = tungstenite::Error> + Unpin,
 {
@@ -253,6 +277,10 @@ where
                 return Ended::ByServer(code, reason);
             }
             Next::Frame(first) => {
+                if !first.wrapped && wire.compression.has_header() && !wire.batch_delay.is_zero() {
+                    // Give more small frames a chance to join this batch.
+                    tokio::time::sleep(wire.batch_delay).await;
+                }
                 let mut batch = vec![first];
                 while batch.len() < MAX_FRAMES_PER_FLUSH && !outbox.has_control() {
                     match outbox.try_next_frame() {
@@ -260,8 +288,10 @@ where
                         None => break,
                     }
                 }
+                let frames = batch.into_iter().map(|q| (q.frame.bytes, q.wrapped)).collect();
+                let batch = wire.compression.wire_frames(wire.format, frames);
                 let written = tokio::select! {
-                    written = write_batch(sink, batch, text_frames) => written,
+                    written = write_batch(sink, batch, wire.text_frames) => written,
                     _ = cut.cut() => Err(None),
                 };
                 match written {
@@ -278,12 +308,12 @@ where
 
 /// Feeds every frame of `batch`, then flushes once. `Err(None)` is never returned here;
 /// it stands for "abandoned" in the caller.
-async fn write_batch<W>(sink: &mut W, batch: Vec<Outbound>, text_frames: bool) -> Result<(), Option<tungstenite::Error>>
+async fn write_batch<W>(sink: &mut W, batch: Vec<Bytes>, text_frames: bool) -> Result<(), Option<tungstenite::Error>>
 where
     W: Sink<Message, Error = tungstenite::Error> + Unpin,
 {
-    for frame in batch {
-        let message = if text_frames { frame_message(frame) } else { Message::Binary(frame.bytes) };
+    for bytes in batch {
+        let message = if text_frames { frame_message(Outbound::reliable(bytes)) } else { Message::Binary(bytes) };
         sink.feed(message).await.map_err(Some)?;
     }
     sink.flush().await.map_err(Some)

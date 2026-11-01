@@ -45,6 +45,10 @@ pub struct ServerConfig {
     /// WebSocket listener settings
     #[serde(default)]
     pub websocket: WebSocketConfig,
+
+    /// Settings of listeners with compression
+    #[serde(default)]
+    pub compression: CompressionConfig,
 }
 
 /// Settings of the WebSocket listener.
@@ -53,6 +57,48 @@ pub struct WebSocketConfig {
     /// Message format: today's JSON envelopes, or bitcode frames.
     #[serde(default)]
     pub protocol: horizon_event_system::Format,
+    /// Compression codec: none (default), zstd or lz4.
+    #[serde(default)]
+    pub compression: horizon_event_system::protocol::Codec,
+}
+
+/// Settings shared by the listeners with compression.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    /// zstd level: 1 to 3 on the hot path, negative for speed. Ignored by lz4.
+    #[serde(default = "default_compression_level")]
+    pub level: i32,
+    /// Frames shorter than this many bytes are batched per recipient instead of being
+    /// compressed alone.
+    #[serde(default = "default_compression_min_size")]
+    pub min_size: usize,
+    /// How long a writer waits for more small frames before compressing a batch, in
+    /// milliseconds (0: only what is already waiting).
+    #[serde(default)]
+    pub batch_delay_ms: u64,
+    /// Optional dictionary file, trained on the game's payloads. Clients must hold the
+    /// same one.
+    #[serde(default)]
+    pub dictionary_path: Option<PathBuf>,
+}
+
+fn default_compression_level() -> i32 {
+    1
+}
+
+fn default_compression_min_size() -> usize {
+    128
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            level: default_compression_level(),
+            min_size: default_compression_min_size(),
+            batch_delay_ms: 0,
+            dictionary_path: None,
+        }
+    }
 }
 
 /// Security configuration for input validation and protection
@@ -111,6 +157,7 @@ impl Default for ServerConfig {
             security: SecurityConfig::default(),
             plugin_safety: PluginSafetyConfig::default(),
             websocket: WebSocketConfig::default(),
+            compression: CompressionConfig::default(),
         }
     }
 }

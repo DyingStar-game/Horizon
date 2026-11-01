@@ -5,6 +5,7 @@
 
 use super::{
     client::ClientConnection,
+    compress::ListenerCompression,
     outbox::{outbox, Control, Outbox, OutboxReceiver, Pushed, DEFAULT_CHANNEL_CAPACITY},
     CloseCode, ConnectionId,
 };
@@ -21,6 +22,18 @@ use tracing::{debug, info};
 struct ConnectionHandle {
     outbox: Outbox,
     profile: ListenerProfile,
+    compression: Arc<ListenerCompression>,
+}
+
+impl ConnectionHandle {
+    /// Queues a frame: large ones wrapped now (compressed once for all recipients),
+    /// small ones left for the writer to batch.
+    fn push(&self, frame: Outbound) -> Pushed {
+        match self.compression.wrap_large(&frame.bytes) {
+            Some(bytes) => self.outbox.push_wrapped(Outbound { bytes, delivery: frame.delivery }),
+            None => self.outbox.push(frame),
+        }
+    }
 }
 
 /// Central manager for all client connections.
@@ -84,12 +97,23 @@ impl ConnectionManager {
         remote_addr: SocketAddr,
         profile: ListenerProfile,
     ) -> (ConnectionId, OutboxReceiver) {
+        self.open_connection_with(remote_addr, profile, Arc::new(ListenerCompression::none()))
+            .await
+    }
+
+    /// Like [`open_connection`](Self::open_connection), for a listener with compression.
+    pub async fn open_connection_with(
+        &self,
+        remote_addr: SocketAddr,
+        profile: ListenerProfile,
+        compression: Arc<ListenerCompression>,
+    ) -> (ConnectionId, OutboxReceiver) {
         let connection_id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = outbox(connection_id, self.channel_capacity);
         self.handles
-            .insert(connection_id, ConnectionHandle { outbox: tx, profile });
+            .insert(connection_id, ConnectionHandle { outbox: tx, profile, compression });
         let connection = ClientConnection::new(remote_addr);
         self.connections.write().await.insert(connection_id, connection);
         info!("🔗 Connection {} from {}", connection_id, remote_addr);
@@ -187,7 +211,7 @@ impl ConnectionManager {
     /// Queues a frame for a specific connection, without waiting.
     pub fn send_frame(&self, connection_id: ConnectionId, frame: Outbound) -> Pushed {
         match self.handles.get(&connection_id) {
-            Some(handle) => handle.outbox.push(frame),
+            Some(handle) => handle.push(frame),
             None => Pushed::Closed,
         }
     }
@@ -223,7 +247,7 @@ impl ConnectionManager {
     pub fn broadcast_frame(&self, frame: Outbound) -> usize {
         let mut delivered = 0;
         for handle in self.handles.iter() {
-            if handle.outbox.push(frame.clone()).is_accepted() {
+            if handle.push(frame.clone()).is_accepted() {
                 delivered += 1;
             }
         }
@@ -318,7 +342,7 @@ impl ConnectionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connection::outbox::Next;
+    use crate::connection::outbox::{Next, Queued};
 
     fn addr() -> SocketAddr {
         "127.0.0.1:9000".parse().unwrap()
@@ -349,7 +373,10 @@ mod tests {
         let manager = ConnectionManager::new();
         let (conn, mut rx) = manager.open_connection(addr(), ListenerProfile::default()).await;
         manager.send_to_connection(conn, b"hello".to_vec()).await;
-        assert_eq!(rx.next().await, Next::Frame(Outbound::reliable(b"hello".to_vec())));
+        assert_eq!(
+            rx.next().await,
+            Next::Frame(Queued { frame: Outbound::reliable(b"hello".to_vec()), wrapped: false })
+        );
         assert_eq!(manager.send_frame(999, Outbound::reliable(Vec::new())), Pushed::Closed);
     }
 
@@ -359,7 +386,9 @@ mod tests {
         let (_a, mut rx_a) = manager.open_connection(addr(), ListenerProfile::default()).await;
         let (_b, mut rx_b) = manager.open_connection(addr(), ListenerProfile::default()).await;
         assert_eq!(manager.broadcast_to_all(b"all".to_vec()).await, 2);
-        let (Next::Frame(a), Next::Frame(b)) = (rx_a.next().await, rx_b.next().await) else {
+        let (Next::Frame(Queued { frame: a, .. }), Next::Frame(Queued { frame: b, .. })) =
+            (rx_a.next().await, rx_b.next().await)
+        else {
             panic!("both connections should get the frame");
         };
         // Same allocation, not a copy.

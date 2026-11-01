@@ -265,12 +265,20 @@ pub struct ListenerProfile {
     pub transport: Transport,
     /// The message format of the listener.
     pub format: Format,
+    /// The compression codec of the listener.
+    pub compression: horizon_protocol::Codec,
 }
 
 impl ListenerProfile {
     /// A profile for the given transport, every other setting at its default.
     pub fn new(transport: Transport) -> Self {
-        Self { transport, format: Format::Json }
+        Self { transport, format: Format::Json, compression: horizon_protocol::Codec::None }
+    }
+
+    /// The same profile with another compression codec.
+    pub fn with_compression(mut self, codec: horizon_protocol::Codec) -> Self {
+        self.compression = codec;
+        self
     }
 
     /// The same profile with another message format.

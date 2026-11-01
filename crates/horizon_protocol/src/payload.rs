@@ -78,7 +78,7 @@ where
 {
     Ok(match format {
         Format::Json => serde_json::to_vec(payload)?,
-        Format::Bitcode => bitcode::encode(payload),
+        Format::Bitcode => crate::bitcode_encode(payload),
     })
 }
 
