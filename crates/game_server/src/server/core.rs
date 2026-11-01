@@ -550,7 +550,7 @@ impl GameServer {
 
         // Register a simple ping handler for testing validity of the client connection
         self.horizon_event_system
-            .on_client("system", "ping", |data: serde_json::Value, player_id: horizon_event_system::PlayerId, conn| {
+            .on_client("system", "ping", |data: serde_json::Value, _player_id: horizon_event_system::PlayerId, conn| {
                 info!("🔧 GameServer: Received 'ping' event with connection: {:?}, data: {:?}", conn, data);
 
                 let response = serde_json::json!({
@@ -560,22 +560,20 @@ impl GameServer {
 
                 debug!("🔧 GameServer: Responding to 'ping' event with response: {:?}", response);
 
-                // Use block_on to execute async response in sync handler
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.block_on(async {
-                        let response_bytes = match serde_json::to_vec(&response) {
-                            Ok(bytes) => bytes,
-                            Err(e) => {
-                                error!("Failed to serialize ping response: {}", e);
-                                return;
-                            }
-                        };
-
-                        if let Err(e) = conn.respond(&response_bytes).await {
-                            error!("Failed to send ping response: {}", e);
-                        }
-                    });
-                }
+                let response_bytes = match serde_json::to_vec(&response) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        error!("Failed to serialize ping response: {}", e);
+                        return Ok(());
+                    }
+                };
+                // The handler runs on a runtime worker, where `block_on` panics; the reply
+                // is queued from a task instead.
+                tokio::spawn(async move {
+                    if let Err(e) = conn.respond(&response_bytes).await {
+                        error!("Failed to send ping response: {}", e);
+                    }
+                });
 
                 Ok(())
         }).await.map_err(|e| ServerError::Internal(e.to_string()))?;

@@ -7,8 +7,17 @@ edition = "2021"
 horizon_event_system = { workspace = true }
 Horizon-Network-Common = { workspace = true }
 tokio-tungstenite = { workspace = true }
+# Use mio-runtime only for musl targets to avoid monoio compatibility issues
+[target.'cfg(target_env = "musl")'.dependencies]
+horizon_sockets = { workspace = true, default-features = false, features = ["mio-runtime"] }
+
+# Use default features (including monoio) for other targets
+[target.'cfg(not(target_env = "musl"))'.dependencies]
+horizon_sockets = { workspace = true }
 plugin_system = { workspace = true }
 futures-util = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
 horizon_bugs = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -23,10 +32,5 @@ serde = { workspace = true }
 libc = { workspace = true }
 bug = { workspace = true }
 
-# Use mio-runtime only for musl targets to avoid monoio compatibility issues
-[target.'cfg(target_env = "musl")'.dependencies]
-horizon_sockets = { workspace = true, default-features = false, features = ["mio-runtime"] }
-
-# Use default features (including monoio) for other targets
-[target.'cfg(not(target_env = "musl"))'.dependencies]
-horizon_sockets = { workspace = true }
+[dev-dependencies]
+tempfile = { workspace = true }

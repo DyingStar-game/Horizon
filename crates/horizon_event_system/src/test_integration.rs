@@ -5,7 +5,7 @@ use tracing::debug;
 
 // Mock server context for testing
 #[cfg(test)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct MockServerContext {
     log_level: LogLevel,
 }

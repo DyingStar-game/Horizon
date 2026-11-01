@@ -115,3 +115,5 @@ mod tests;
 // Authentication integration tests
 #[cfg(test)]
 mod auth_integration_tests;
+#[cfg(test)]
+mod ws_tests;
