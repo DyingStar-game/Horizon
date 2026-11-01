@@ -28,3 +28,6 @@ pub mod distance_filtering_test;
 
 #[cfg(test)]
 pub mod realistic_movement_test;
+
+#[cfg(test)]
+pub mod format_test;

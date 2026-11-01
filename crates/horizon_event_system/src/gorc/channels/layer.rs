@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Duration;
 
 /// Configuration for a replication layer within a channel
+#[allow(deprecated)] // derives touch the deprecated compression field
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplicationLayer {
     /// Channel number (0-3)
@@ -15,12 +16,28 @@ pub struct ReplicationLayer {
     pub frequency: f64,
     /// Properties to replicate at this layer
     pub properties: Vec<String>,
-    /// Compression type for this layer
+    /// Compression type for this layer.
+    ///
+    /// Has no effect on the wire: it only feeds [`estimated_compression_ratio`]. Frames
+    /// are compressed per listener (`[server.websocket] compression`), which supersedes
+    /// this field; it will be removed.
+    ///
+    /// [`estimated_compression_ratio`]: ReplicationLayer::estimated_compression_ratio
+    #[deprecated(
+        since = "0.27.0",
+        note = "has no effect on the wire: compression is a listener setting ([server.websocket] / [server.webtransport] compression). This field will be removed; ReplicationLayer::new keeps its parameter."
+    )]
+    #[serde(default)]
     pub compression: CompressionType,
     /// Priority level for this layer
     pub priority: ReplicationPriority,
+    /// How this layer's events travel to clients by default: unreliable layers are
+    /// "latest wins" data (transforms...) that may be dropped and arrive out of order.
+    #[serde(default)]
+    pub delivery: crate::Delivery,
 }
 
+#[allow(deprecated)] // the deprecated compression field
 impl ReplicationLayer {
     /// Creates a new replication layer
     pub fn new(
@@ -45,7 +62,21 @@ impl ReplicationLayer {
             properties,
             compression,
             priority,
+            delivery: crate::Delivery::Reliable,
         }
+    }
+
+    /// The same layer with another delivery class.
+    ///
+    /// ```
+    /// use horizon_event_system::{CompressionType, Delivery, ReplicationLayer};
+    /// let transforms = ReplicationLayer::new(0, 50.0, 30.0, vec!["position".into()], CompressionType::None)
+    ///     .with_delivery(Delivery::Unreliable);
+    /// assert_eq!(transforms.delivery, Delivery::Unreliable);
+    /// ```
+    pub fn with_delivery(mut self, delivery: crate::Delivery) -> Self {
+        self.delivery = delivery;
+        self
     }
 
     /// Get the update interval for this layer
@@ -192,5 +223,27 @@ impl ReplicationLayers {
         ));
         
         layers
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layers_without_compression_still_deserialize() {
+        let layer: ReplicationLayer = serde_json::from_str(
+            r#"{"channel":0,"radius":50.0,"frequency":30.0,"properties":["position"],"priority":"Critical"}"#,
+        )
+        .unwrap();
+        assert_eq!(layer.channel, 0);
+        assert_eq!(layer.delivery, crate::Delivery::Reliable);
+    }
+
+    #[test]
+    fn new_keeps_its_signature() {
+        let layer = ReplicationLayer::new(1, 10.0, 5.0, vec![], CompressionType::Lz4)
+            .with_delivery(crate::Delivery::Unreliable);
+        assert_eq!(layer.priority, ReplicationPriority::High);
+        assert_eq!(layer.delivery, crate::Delivery::Unreliable);
     }
 }

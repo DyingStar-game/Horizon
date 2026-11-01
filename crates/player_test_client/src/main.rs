@@ -9,7 +9,8 @@
 
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
-use horizon_event_system::{PlayerId, Vec3, GorcObjectId};
+use horizon_event_system::{PlayerId, Vec3, GorcObjectId, Format};
+use horizon_event_system::protocol::{self, ClientFrame, Codec, Compression, EventKey, ServerFrame, PROTOCOL_VERSION};
 use plugin_player::events::{PlayerMoveRequest, PlayerAttackRequest, PlayerChatRequest};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -61,6 +62,40 @@ struct Args {
     /// Log file path for JSON messages
     #[arg(long, default_value = "horizon_messages.log")]
     log_file: String,
+
+    /// Message format of the server's listener: json or bitcode
+    #[arg(long, default_value = "json", value_parser = parse_format)]
+    format: Format,
+
+    /// Compression of the server's listener: none, zstd or lz4 (bitcode format only)
+    #[arg(long, default_value = "none", value_parser = parse_codec)]
+    compression: Codec,
+
+    /// Transport: websocket, or webtransport (bitcode format only; --url is then
+    /// https://host:port/)
+    #[arg(long, default_value = "websocket")]
+    transport: String,
+
+    /// WebTransport: accept any server certificate (self-signed test servers)
+    #[arg(long, default_value = "false")]
+    insecure: bool,
+}
+
+fn parse_codec(value: &str) -> Result<Codec, String> {
+    match value {
+        "none" => Ok(Codec::None),
+        "zstd" => Ok(Codec::Zstd),
+        "lz4" => Ok(Codec::Lz4),
+        other => Err(format!("unknown compression '{other}' (none, zstd or lz4)")),
+    }
+}
+
+fn parse_format(value: &str) -> Result<Format, String> {
+    match value {
+        "json" => Ok(Format::Json),
+        "bitcode" => Ok(Format::Bitcode),
+        other => Err(format!("unknown format '{other}' (json or bitcode)")),
+    }
 }
 
 /// GORC event message format for client-to-server communication
@@ -737,6 +772,223 @@ async fn simulate_player(
 }
 
 /// Calculate spawn positions in a circular formation
+/// What a bitcode player received, by frame type.
+#[derive(Debug, Default)]
+struct BitcodeStats {
+    zone_enters: usize,
+    zone_exits: usize,
+    gorc_events: usize,
+    events: usize,
+    bytes: usize,
+}
+
+/// Simulates a player on a bitcode listener: handshake, then movement as bitcode GORC
+/// events, counting what the server sends back. Chat, combat and scans are JSON-only in
+/// `plugin_player` and are not sent.
+async fn simulate_player_bitcode(
+    player_id: PlayerId,
+    ws_url: String,
+    args: Args,
+    spawn_position: Vec3,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (ws_stream, _) = connect_async(&ws_url).await?;
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
+    let compression = Compression::with_codec(args.compression);
+    let hello = ClientFrame::Hello {
+        protocol_version: PROTOCOL_VERSION,
+        client: "player_test_client".into(),
+        dictionary_id: None,
+    };
+    ws_sender.send(Message::Binary(compression.wrap(&protocol::encode_client(&hello)).to_vec())).await?;
+
+    let mut player = SimulatedPlayer::new(player_id, spawn_position);
+    let mut own_handle: Option<u32> = None;
+    let mut move_event = EventKey::name("move");
+    let mut stats = BitcodeStats::default();
+    let mut sent = 0usize;
+    let mut move_timer = interval(Duration::from_secs_f64(1.0 / args.move_freq));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.duration);
+    info!("🎮 Player {} connected (bitcode)", player_id);
+
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            msg = ws_receiver.next() => {
+                let bytes = match msg {
+                    Some(Ok(Message::Binary(bytes))) => bytes,
+                    Some(Ok(Message::Close(frame))) => {
+                        warn!("Player {} closed by server: {:?}", player_id, frame);
+                        break;
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => return Err(e.into()),
+                    None => break,
+                };
+                stats.bytes += bytes.len();
+                let body = compression.unwrap(&bytes, usize::MAX)?;
+                let frames = match protocol::decode_server(&body, usize::MAX)? {
+                    ServerFrame::Batch { frames } => ServerFrame::unbatch(&frames)?,
+                    frame => vec![frame],
+                };
+                for frame in frames {
+                match frame {
+                    ServerFrame::HelloAck { event_table, .. } => {
+                        if let Some((id, _)) = event_table.iter().find(|(_, name)| name == "move") {
+                            move_event = EventKey::Id(*id);
+                        }
+                    }
+                    ServerFrame::ZoneEnter { handle, object_type, .. } => {
+                        stats.zone_enters += 1;
+                        // As in JSON mode, the client drives the object it last entered.
+                        if object_type == "GorcPlayer" || own_handle.is_none() {
+                            own_handle = Some(handle);
+                        }
+                    }
+                    ServerFrame::ZoneExit { .. } => stats.zone_exits += 1,
+                    ServerFrame::GorcEvent { .. } => stats.gorc_events += 1,
+                    ServerFrame::Event { .. } => stats.events += 1,
+                    ServerFrame::Disconnect { code, reason } => {
+                        warn!("Player {} disconnected: {} {}", player_id, code, reason);
+                    }
+                    _ => {}
+                }
+                }
+            }
+            _ = move_timer.tick() => {
+                let delta_time = 1.0 / args.move_freq as f32;
+                let Some(handle) = own_handle else { continue };
+                if !player.update_movement(delta_time, args.world_size) {
+                    continue;
+                }
+                let request = PlayerMoveRequest {
+                    player_id,
+                    new_position: player.position,
+                    velocity: player.velocity,
+                    movement_state: 1,
+                    client_timestamp: chrono::Utc::now(),
+                };
+                let payload = protocol::payload::encode_serde(Format::Bitcode, &request)?;
+                let frame = ClientFrame::GorcEvent { handle, channel: 0, event: move_event.clone(), payload };
+                ws_sender.send(Message::Binary(compression.wrap(&protocol::encode_client(&frame)).to_vec())).await?;
+                sent += 1;
+            }
+        }
+    }
+    info!(
+        "📊 Player {} (bitcode): sent {} moves; received {} zone enters, {} zone exits, {} GORC events, {} events, {} bytes",
+        player_id, sent, stats.zone_enters, stats.zone_exits, stats.gorc_events, stats.events, stats.bytes
+    );
+    Ok(())
+}
+
+/// Like [`simulate_player_bitcode`], over WebTransport: frames on the reliable stream,
+/// movement sent as datagrams (unreliable), and the server's datagrams counted too.
+async fn simulate_player_webtransport(
+    player_id: PlayerId,
+    url: String,
+    args: Args,
+    spawn_position: Vec3,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use horizon_event_system::protocol::stream::{write_frame, FrameSplitter};
+    let builder = wtransport::ClientConfig::builder().with_bind_default();
+    let config = if args.insecure {
+        builder.with_no_cert_validation().build()
+    } else {
+        builder.with_native_certs().build()
+    };
+    let endpoint = wtransport::Endpoint::client(config)?;
+    let connection = endpoint.connect(&url).await?;
+    let (mut send, mut recv) = connection.open_bi().await?.await?;
+    let compression = Compression::with_codec(args.compression);
+    let mut out = Vec::new();
+    let hello = ClientFrame::Hello { protocol_version: PROTOCOL_VERSION, client: "player_test_client".into(), dictionary_id: None };
+    write_frame(&mut out, &compression.wrap(&protocol::encode_client(&hello)));
+    send.write_all(&out).await?;
+
+    let mut player = SimulatedPlayer::new(player_id, spawn_position);
+    let mut own_handle: Option<u32> = None;
+    let mut move_event = EventKey::name("move");
+    let mut stats = BitcodeStats::default();
+    let mut datagrams = 0usize;
+    let mut sent = 0usize;
+    let mut splitter = FrameSplitter::new();
+    let mut buffer = vec![0u8; 16 * 1024];
+    let mut move_timer = interval(Duration::from_secs_f64(1.0 / args.move_freq));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(args.duration);
+    info!("🎮 Player {} connected (WebTransport)", player_id);
+
+    loop {
+        let mut received: Vec<Vec<u8>> = Vec::new();
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => break,
+            read = recv.read(&mut buffer) => match read? {
+                Some(read) => {
+                    splitter.push(&buffer[..read]);
+                    while let Some(frame) = splitter.next_frame(usize::MAX)? {
+                        received.push(frame);
+                    }
+                }
+                None => break,
+            },
+            datagram = connection.receive_datagram() => {
+                datagrams += 1;
+                received.push(datagram?.payload().to_vec());
+            }
+            _ = move_timer.tick() => {
+                let delta_time = 1.0 / args.move_freq as f32;
+                let Some(handle) = own_handle else { continue };
+                if !player.update_movement(delta_time, args.world_size) {
+                    continue;
+                }
+                let request = PlayerMoveRequest {
+                    player_id,
+                    new_position: player.position,
+                    velocity: player.velocity,
+                    movement_state: 1,
+                    client_timestamp: chrono::Utc::now(),
+                };
+                let payload = protocol::payload::encode_serde(Format::Bitcode, &request)?;
+                let frame = ClientFrame::GorcEvent { handle, channel: 0, event: move_event.clone(), payload };
+                connection.send_datagram(compression.wrap(&protocol::encode_client(&frame)))?;
+                sent += 1;
+            }
+        }
+        for bytes in received {
+            stats.bytes += bytes.len();
+            let body = compression.unwrap(&bytes, usize::MAX)?;
+            let frames = match protocol::decode_server(&body, usize::MAX)? {
+                ServerFrame::Batch { frames } => ServerFrame::unbatch(&frames)?,
+                frame => vec![frame],
+            };
+            for frame in frames {
+                match frame {
+                    ServerFrame::HelloAck { event_table, .. } => {
+                        if let Some((id, _)) = event_table.iter().find(|(_, name)| name == "move") {
+                            move_event = EventKey::Id(*id);
+                        }
+                    }
+                    ServerFrame::ZoneEnter { handle, object_type, .. } => {
+                        stats.zone_enters += 1;
+                        if object_type == "GorcPlayer" || own_handle.is_none() {
+                            own_handle = Some(handle);
+                        }
+                    }
+                    ServerFrame::ZoneExit { .. } => stats.zone_exits += 1,
+                    ServerFrame::GorcEvent { .. } => stats.gorc_events += 1,
+                    ServerFrame::Event { .. } => stats.events += 1,
+                    ServerFrame::Disconnect { code, reason } => warn!("Player {} disconnected: {} {}", player_id, code, reason),
+                    _ => {}
+                }
+            }
+        }
+    }
+    info!(
+        "📊 Player {} (WebTransport): sent {} moves as datagrams; received {} zone enters, {} GORC events, {} datagrams, {} bytes",
+        player_id, sent, stats.zone_enters, stats.gorc_events, datagrams, stats.bytes
+    );
+    Ok(())
+}
+
 fn calculate_spawn_positions(num_players: u32, world_size: f32) -> Vec<Vec3> {
     let mut positions = Vec::new();
     let spawn_radius = world_size / 4.0; // Keep spawns in center area
@@ -797,11 +1049,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             world_size: args.world_size,
             log_messages: args.log_messages,
             log_file: args.log_file.clone(),
+            format: args.format,
+            compression: args.compression,
+            transport: args.transport.clone(),
+            insecure: args.insecure,
         };
         
         let logger_clone = message_logger.clone();
         let handle = tokio::spawn(async move {
-            if let Err(e) = simulate_player(player_id, ws_url, args_clone, spawn_pos, logger_clone).await {
+            let result = match args_clone.format {
+                Format::Json => simulate_player(player_id, ws_url, args_clone, spawn_pos, logger_clone).await,
+                Format::Bitcode if args_clone.transport == "webtransport" => {
+                    simulate_player_webtransport(player_id, ws_url, args_clone, spawn_pos).await
+                }
+                Format::Bitcode => simulate_player_bitcode(player_id, ws_url, args_clone, spawn_pos).await,
+            };
+            if let Err(e) = result {
                 error!("❌ Player {} simulation failed: {}", player_id, e);
             }
         });
