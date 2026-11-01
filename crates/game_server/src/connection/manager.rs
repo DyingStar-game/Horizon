@@ -18,11 +18,45 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 /// What the server holds to reach one connection.
+/// What a transport knows about a live connection.
+pub trait TransportInfo: Send + Sync + std::fmt::Debug {
+    /// The round-trip time the transport measures.
+    fn rtt(&self) -> Option<std::time::Duration>;
+    /// The largest datagram the connection accepts now, if it has datagrams.
+    fn max_datagram_size(&self) -> Option<usize>;
+}
+
+/// What happened to unreliable frames, for metrics.
+#[derive(Debug, Default)]
+pub struct DeliveryStats {
+    /// Sent as datagrams.
+    pub datagrams_sent: std::sync::atomic::AtomicU64,
+    /// Dropped because the connection was behind.
+    pub dropped_behind: std::sync::atomic::AtomicU64,
+    /// Dropped because they waited longer than their maximum age.
+    pub dropped_too_old: std::sync::atomic::AtomicU64,
+    /// Sent reliably instead: no datagrams on the transport, or too large for one.
+    pub sent_reliably: std::sync::atomic::AtomicU64,
+}
+
+impl DeliveryStats {
+    /// Adds one to a counter.
+    pub fn count(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A counter's value.
+    pub fn get(counter: &std::sync::atomic::AtomicU64) -> u64 {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ConnectionHandle {
     outbox: Outbox,
     profile: ListenerProfile,
     compression: Arc<ListenerCompression>,
+    transport: Option<Arc<dyn TransportInfo>>,
 }
 
 impl ConnectionHandle {
@@ -64,6 +98,9 @@ pub struct ConnectionManager {
 
     /// Frames each connection's channel holds before its backlog takes over.
     channel_capacity: usize,
+
+    /// What became of unreliable frames, all connections together.
+    delivery_stats: DeliveryStats,
 }
 
 impl Default for ConnectionManager {
@@ -87,6 +124,7 @@ impl ConnectionManager {
             players: DashMap::new(),
             next_id: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
             channel_capacity: capacity,
+            delivery_stats: DeliveryStats::default(),
         }
     }
 
@@ -113,7 +151,7 @@ impl ConnectionManager {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (tx, rx) = outbox(connection_id, self.channel_capacity);
         self.handles
-            .insert(connection_id, ConnectionHandle { outbox: tx, profile, compression });
+            .insert(connection_id, ConnectionHandle { outbox: tx, profile, compression, transport: None });
         let connection = ClientConnection::new(remote_addr);
         self.connections.write().await.insert(connection_id, connection);
         info!("🔗 Connection {} from {}", connection_id, remote_addr);
@@ -268,6 +306,23 @@ impl ConnectionManager {
             .unwrap_or(false)
     }
 
+    /// Attaches what the transport knows about a connection (RTT, datagram size).
+    pub fn set_transport_info(&self, connection_id: ConnectionId, info: Arc<dyn TransportInfo>) {
+        if let Some(mut handle) = self.handles.get_mut(&connection_id) {
+            handle.transport = Some(info);
+        }
+    }
+
+    /// What the transport knows about a connection.
+    pub fn transport_info(&self, connection_id: ConnectionId) -> Option<Arc<dyn TransportInfo>> {
+        self.handles.get(&connection_id).and_then(|handle| handle.transport.clone())
+    }
+
+    /// What became of unreliable frames.
+    pub fn delivery_stats(&self) -> &DeliveryStats {
+        &self.delivery_stats
+    }
+
     /// Number of open connections.
     pub fn connection_count(&self) -> usize {
         self.handles.len()
@@ -373,10 +428,8 @@ mod tests {
         let manager = ConnectionManager::new();
         let (conn, mut rx) = manager.open_connection(addr(), ListenerProfile::default()).await;
         manager.send_to_connection(conn, b"hello".to_vec()).await;
-        assert_eq!(
-            rx.next().await,
-            Next::Frame(Queued { frame: Outbound::reliable(b"hello".to_vec()), wrapped: false })
-        );
+        let Next::Frame(queued) = rx.next().await else { panic!("expected a frame") };
+        assert_eq!((queued.frame, queued.wrapped), (Outbound::reliable(b"hello".to_vec()), false));
         assert_eq!(manager.send_frame(999, Outbound::reliable(Vec::new())), Pushed::Closed);
     }
 

@@ -108,7 +108,7 @@ impl ListenerCompression {
 }
 
 /// Several encoded frames as one batch frame.
-fn batch(format: Format, frames: &[Bytes]) -> Vec<u8> {
+pub(crate) fn batch(format: Format, frames: &[Bytes]) -> Vec<u8> {
     match format {
         Format::Json => {
             let slices: Vec<&[u8]> = frames.iter().map(|f| f.as_ref()).collect();

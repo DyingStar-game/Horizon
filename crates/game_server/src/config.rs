@@ -49,6 +49,10 @@ pub struct ServerConfig {
     /// Settings of listeners with compression
     #[serde(default)]
     pub compression: CompressionConfig,
+
+    /// WebTransport listener settings
+    #[serde(default)]
+    pub webtransport: WebTransportConfig,
 }
 
 /// Settings of the WebSocket listener.
@@ -60,6 +64,63 @@ pub struct WebSocketConfig {
     /// Compression codec: none (default), zstd or lz4.
     #[serde(default)]
     pub compression: horizon_event_system::protocol::Codec,
+    /// TLS certificate (PEM). Set with `key_path` to serve `wss://`; not needed when
+    /// an ingress or load balancer terminates TLS.
+    #[serde(default)]
+    pub cert_path: Option<PathBuf>,
+    /// TLS private key (PEM).
+    #[serde(default)]
+    pub key_path: Option<PathBuf>,
+}
+
+/// Settings of the WebTransport listener (`[server.webtransport]`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WebTransportConfig {
+    /// Whether to open the listener.
+    pub enabled: bool,
+    /// UDP address: reliable streams and datagrams share this one QUIC port.
+    pub bind_address: SocketAddr,
+    /// Message format.
+    pub protocol: horizon_event_system::Format,
+    /// Compression codec.
+    pub compression: horizon_event_system::protocol::Codec,
+    /// TLS certificate (PEM), required: WebTransport always runs over TLS.
+    pub cert_path: Option<PathBuf>,
+    /// TLS private key (PEM).
+    pub key_path: Option<PathBuf>,
+    /// Close sessions without traffic for this long.
+    pub idle_timeout_ms: u64,
+    /// QUIC keep-alive interval.
+    pub keepalive_ms: u64,
+    /// Cap on the datagram size, in bytes.
+    pub max_datagram_size: usize,
+    /// quinn's buffer of datagrams waiting for congestion control, in bytes (quinn's
+    /// own default is 1 MiB: seconds of stale positions on a slow link).
+    pub datagram_send_buffer_bytes: usize,
+    /// Unreliable frames older than this are dropped instead of sent.
+    pub unreliable_max_age_ms: u64,
+    /// How often the certificate files are checked for changes.
+    pub cert_reload_interval_ms: u64,
+}
+
+impl Default for WebTransportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bind_address: "0.0.0.0:4433".parse().expect("valid default address"),
+            protocol: horizon_event_system::Format::Bitcode,
+            compression: horizon_event_system::protocol::Codec::None,
+            cert_path: None,
+            key_path: None,
+            idle_timeout_ms: 15_000,
+            keepalive_ms: 5_000,
+            max_datagram_size: 1200,
+            datagram_send_buffer_bytes: 16 * 1024,
+            unreliable_max_age_ms: 100,
+            cert_reload_interval_ms: 10_000,
+        }
+    }
 }
 
 /// Settings shared by the listeners with compression.
@@ -103,6 +164,7 @@ impl Default for CompressionConfig {
 
 /// Security configuration for input validation and protection
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SecurityConfig {
     /// Enable rate limiting
     pub enable_rate_limiting: bool,
@@ -158,6 +220,7 @@ impl Default for ServerConfig {
             plugin_safety: PluginSafetyConfig::default(),
             websocket: WebSocketConfig::default(),
             compression: CompressionConfig::default(),
+            webtransport: WebTransportConfig::default(),
         }
     }
 }

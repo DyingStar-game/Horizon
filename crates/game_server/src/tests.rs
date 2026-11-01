@@ -307,6 +307,7 @@ mod tests {
             plugin_safety: Default::default(),
             websocket: Default::default(),
             compression: Default::default(),
+            webtransport: Default::default(),
         };
 
         assert_eq!(config.bind_address.to_string(), "0.0.0.0:3000");
@@ -385,6 +386,7 @@ mod tests {
             plugin_safety: Default::default(),
             websocket: Default::default(),
             compression: Default::default(),
+            webtransport: Default::default(),
         };
 
         let server = create_server_with_config(config);

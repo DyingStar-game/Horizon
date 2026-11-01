@@ -46,6 +46,8 @@ pub struct Queued {
     /// header byte added, compressed if large). Unwrapped frames are grouped and
     /// wrapped by the writer.
     pub wrapped: bool,
+    /// When the frame was queued, for unreliable frames that are too old to send.
+    pub queued_at: Instant,
 }
 
 impl Queued {
@@ -176,12 +178,12 @@ pub fn outbox(connection_id: ConnectionId, capacity: usize) -> (Outbox, OutboxRe
 impl Outbox {
     /// Queue `frame` for the client without waiting; the writer wraps it for the wire.
     pub fn push(&self, frame: Outbound) -> Pushed {
-        self.push_queued(Queued { frame, wrapped: false })
+        self.push_queued(Queued { frame, wrapped: false, queued_at: Instant::now() })
     }
 
     /// Queue a frame already wrapped for the wire.
     pub fn push_wrapped(&self, frame: Outbound) -> Pushed {
-        self.push_queued(Queued { frame, wrapped: true })
+        self.push_queued(Queued { frame, wrapped: true, queued_at: Instant::now() })
     }
 
     fn push_queued(&self, frame: Queued) -> Pushed {
@@ -287,6 +289,11 @@ impl OutboxReceiver {
         }
     }
 
+    /// Whether frames are waiting in the backlog, that is, whether the client is behind.
+    pub fn is_behind(&self) -> bool {
+        !self.shared.backlog().queue.is_empty()
+    }
+
     /// Whether a control item is waiting.
     pub fn has_control(&self) -> bool {
         !self.control.is_empty()
@@ -382,8 +389,10 @@ mod tests {
         let (tx, mut rx) = outbox(1, 4);
         tx.push(frame(0));
         tx.push_wrapped(frame(1));
-        assert_eq!(rx.try_next_frame(), Some(Queued { frame: frame(0), wrapped: false }));
-        assert_eq!(rx.try_next_frame(), Some(Queued { frame: frame(1), wrapped: true }));
+        let first = rx.try_next_frame().unwrap();
+        let second = rx.try_next_frame().unwrap();
+        assert_eq!((first.frame, first.wrapped), (frame(0), false));
+        assert_eq!((second.frame, second.wrapped), (frame(1), true));
     }
 
     #[tokio::test]

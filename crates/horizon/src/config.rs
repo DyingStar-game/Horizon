@@ -61,19 +61,17 @@ pub struct ServerSettings {
     /// Settings of listeners with compression (`[server.compression]`)
     #[serde(default)]
     pub compression: game_server::config::CompressionConfig,
+    /// WebTransport listener settings (`[server.webtransport]`), disabled by default
+    #[serde(default)]
+    pub webtransport: game_server::config::WebTransportConfig,
+    /// Security limits (`[server.security]`); every key is optional
+    #[serde(default)]
+    pub security: game_server::config::SecurityConfig,
 }
 
 /// `[server.websocket]`: settings of the WebSocket listener. Every key is optional;
-/// without the table the listener speaks JSON, as it always has.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct WebSocketSettings {
-    /// Message format: "json" (default) or "bitcode"
-    #[serde(default)]
-    pub protocol: horizon_event_system::Format,
-    /// Compression: "none" (default), "zstd" or "lz4"
-    #[serde(default)]
-    pub compression: horizon_event_system::protocol::Codec,
-}
+/// without the table the listener speaks JSON over plain WebSocket, as it always has.
+pub type WebSocketSettings = game_server::config::WebSocketConfig;
 
 /// Default for connection_timeout
 pub fn default_connection_timeout() -> u64 {
@@ -411,6 +409,8 @@ impl Default for AppConfig {
                 tick_interval_ms: 50,
                 websocket: WebSocketSettings::default(),
                 compression: Default::default(),
+                webtransport: Default::default(),
+                security: Default::default(),
             },
             plugins: PluginSettings {
                 directory: "plugins".to_string(),
@@ -483,13 +483,11 @@ impl AppConfig {
             connection_timeout: self.server.connection_timeout,
             use_reuse_port: self.server.use_reuse_port,
             tick_interval_ms: self.server.tick_interval_ms,
-            security: Default::default(),
+            security: self.server.security.clone(),
             plugin_safety,
-            websocket: game_server::config::WebSocketConfig {
-                protocol: self.server.websocket.protocol,
-                compression: self.server.websocket.compression,
-            },
+            websocket: self.server.websocket.clone(),
             compression: self.server.compression.clone(),
+            webtransport: self.server.webtransport.clone(),
         })
     }
 
@@ -662,6 +660,8 @@ mod tests {
             tick_interval_ms: 16,
             websocket: WebSocketSettings::default(),
             compression: Default::default(),
+            webtransport: Default::default(),
+            security: Default::default(),
         };
 
         assert_eq!(settings.bind_address, "0.0.0.0:9999");
@@ -808,6 +808,8 @@ file_path = "/tmp/test.log"
                 tick_interval_ms: 25,
                 websocket: WebSocketSettings::default(),
                 compression: Default::default(),
+                webtransport: Default::default(),
+                security: Default::default(),
             },
             plugins: PluginSettings {
                 directory: "/srv/plugins".to_string(),

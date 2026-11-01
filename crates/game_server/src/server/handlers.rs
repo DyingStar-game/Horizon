@@ -49,6 +49,13 @@ pub struct ListenerSettings {
     pub compression: Arc<ListenerCompression>,
     /// How long the writer waits for more small frames before compressing a batch.
     pub batch_delay: Duration,
+    /// Connections refused past this many open ones (all listeners), with close code
+    /// 4007.
+    pub max_connections: usize,
+    /// Addresses whose connections are dropped before any handshake.
+    pub banned_ips: Arc<Vec<std::net::IpAddr>>,
+    /// TLS for WebSocket (`wss://`), when configured.
+    pub tls: Option<crate::transport::tls::ReloadingAcceptor>,
 }
 
 impl Default for ListenerSettings {
@@ -59,6 +66,9 @@ impl Default for ListenerSettings {
             max_decode_errors: 5,
             compression: Arc::new(ListenerCompression::none()),
             batch_delay: Duration::ZERO,
+            max_connections: usize::MAX,
+            banned_ips: Arc::new(Vec::new()),
+            tls: None,
         }
     }
 }
@@ -80,10 +90,28 @@ pub async fn handle_connection(
     horizon_event_system: Arc<EventSystem>,
     settings: ListenerSettings,
 ) -> Result<(), ServerError> {
-    let ws_stream = accept_async(stream)
-        .await
-        .map_err(|e| ServerError::Network(format!("WebSocket handshake failed: {e}")))?;
-    serve_websocket(ws_stream, addr, connection_manager, horizon_event_system, settings).await
+    if settings.banned_ips.contains(&addr.ip()) {
+        debug!("Dropped a connection from banned address {}", addr.ip());
+        return Ok(());
+    }
+    match settings.tls.as_ref().map(|tls| tls.acceptor()) {
+        Some(acceptor) => {
+            let tls_stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|e| ServerError::Network(format!("TLS handshake failed: {e}")))?;
+            let ws_stream = accept_async(tls_stream)
+                .await
+                .map_err(|e| ServerError::Network(format!("WebSocket handshake failed: {e}")))?;
+            serve_websocket(ws_stream, addr, connection_manager, horizon_event_system, settings).await
+        }
+        None => {
+            let ws_stream = accept_async(stream)
+                .await
+                .map_err(|e| ServerError::Network(format!("WebSocket handshake failed: {e}")))?;
+            serve_websocket(ws_stream, addr, connection_manager, horizon_event_system, settings).await
+        }
+    }
 }
 
 /// Why a connection ended, as seen by its handler.
@@ -128,6 +156,11 @@ pub(crate) async fn serve_websocket<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    if connection_manager.connection_count() >= settings.max_connections {
+        let (mut sink, _) = ws_stream.split();
+        send_close(&mut sink, CloseCode::ServerFull, CloseCode::ServerFull.default_reason()).await;
+        return Ok(());
+    }
     let (connection_id, mut outbox) = connection_manager
         .open_connection_with(addr, settings.profile, settings.compression.clone())
         .await;
@@ -210,6 +243,7 @@ where
         format: settings.profile.format,
         compression: settings.compression.clone(),
         batch_delay: settings.batch_delay,
+        connection_manager: connection_manager.clone(),
     };
     let outgoing_task = write_frames(&mut ws_sender, &mut outbox, &wire);
 
@@ -258,6 +292,7 @@ struct Wire {
     format: Format,
     compression: Arc<ListenerCompression>,
     batch_delay: Duration,
+    connection_manager: Arc<ConnectionManager>,
 }
 
 async fn write_frames<W>(sink: &mut W, outbox: &mut OutboxReceiver, wire: &Wire) -> Ended
@@ -286,6 +321,13 @@ where
                     match outbox.try_next_frame() {
                         Some(frame) => batch.push(frame),
                         None => break,
+                    }
+                }
+                // WebSocket has no datagrams: unreliable frames go reliably, counted.
+                let stats = wire.connection_manager.delivery_stats();
+                for queued in &batch {
+                    if queued.frame.delivery == horizon_event_system::Delivery::Unreliable {
+                        crate::connection::manager::DeliveryStats::count(&stats.sent_reliably);
                     }
                 }
                 let frames = batch.into_iter().map(|q| (q.frame.bytes, q.wrapped)).collect();
