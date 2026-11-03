@@ -5,81 +5,171 @@
 //! handshaking, message processing, and cleanup.
 
 use crate::{
-    connection::ConnectionManager,
+    connection::{
+        outbox::{Control, Next, OutboxReceiver},
+        CloseCode, ConnectionManager, ListenerCompression,
+    },
     error::ServerError,
-    messaging::route_client_message,
+    messaging::{route_client_frame, Routed, Session},
 };
-use futures::{SinkExt, StreamExt};
+use bytes::Bytes;
+use futures::{Sink, SinkExt, StreamExt};
 use horizon_event_system::{
-    current_timestamp, DisconnectReason, EventSystem, PlayerConnectedEvent,
-    PlayerDisconnectedEvent, PlayerId,
+    current_timestamp, DisconnectReason, EventSystem, Format, ListenerProfile, Outbound,
+    PlayerConnectedEvent, PlayerDisconnectedEvent, PlayerId, Transport,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{accept_async, tungstenite::Message};
-use tracing::{debug, error, trace};
+use tokio_tungstenite::{
+    accept_async,
+    tungstenite::{self, protocol::{frame::coding::CloseCode as WsCloseCode, CloseFrame}, Message, Utf8Bytes},
+    WebSocketStream,
+};
+use tracing::{debug, error, trace, warn};
+
+/// Most frames written before one flush, so a long backlog still flushes regularly.
+const MAX_FRAMES_PER_FLUSH: usize = 256;
+
+/// How long the writer waits to deliver a close frame before giving up on the client.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What a listener accepts, applied to each of its connections.
+#[derive(Debug, Clone)]
+pub struct ListenerSettings {
+    /// Transport, message format and compression codec.
+    pub profile: ListenerProfile,
+    /// Largest frame accepted from a client, in bytes (after decompression).
+    pub max_frame_size: usize,
+    /// Undecodable frames tolerated before the connection is closed.
+    pub max_decode_errors: u32,
+    /// Compression settings, shared by the listener's connections.
+    pub compression: Arc<ListenerCompression>,
+    /// How long the writer waits for more small frames before compressing a batch.
+    pub batch_delay: Duration,
+    /// Connections refused past this many open ones (all listeners), with close code
+    /// 4007.
+    pub max_connections: usize,
+    /// Addresses whose connections are dropped before any handshake.
+    pub banned_ips: Arc<Vec<std::net::IpAddr>>,
+    /// TLS for WebSocket (`wss://`), when configured.
+    pub tls: Option<crate::transport::tls::ReloadingAcceptor>,
+}
+
+impl Default for ListenerSettings {
+    fn default() -> Self {
+        Self {
+            profile: ListenerProfile::new(Transport::WebSocket),
+            max_frame_size: horizon_event_system::protocol::DEFAULT_MAX_FRAME_SIZE,
+            max_decode_errors: 5,
+            compression: Arc::new(ListenerCompression::none()),
+            batch_delay: Duration::ZERO,
+            max_connections: usize::MAX,
+            banned_ips: Arc::new(Vec::new()),
+            tls: None,
+        }
+    }
+}
 
 /// Handles a single client connection from establishment to cleanup.
-/// 
-/// This function manages the complete lifecycle of a client connection,
-/// including WebSocket handshaking, player ID assignment, message routing,
-/// and proper cleanup when the connection ends.
-/// 
+///
 /// # Connection Flow
-/// 
+///
 /// 1. Perform WebSocket handshake
-/// 2. Register connection with the connection manager
+/// 2. Register the connection, with its own outbox, in the connection manager
 /// 3. Generate and assign a player ID
 /// 4. Emit player connected event
-/// 5. Start message handling tasks (incoming and outgoing)
-/// 6. Handle connection termination and cleanup
-/// 7. Emit player disconnected event
-/// 
-/// # Arguments
-/// 
-/// * `stream` - The TCP stream for the client connection
-/// * `addr` - The remote address of the client
-/// * `connection_manager` - Manager for tracking connections
-/// * `horizon_event_system` - Event system for plugin communication
-/// 
-/// # Returns
-/// 
-/// `Ok(())` if the connection was handled successfully, or a `ServerError`
-/// if there was a failure during connection handling.
-/// 
-/// # Message Handling
-/// 
-/// The function spawns two concurrent tasks:
-/// 
-/// * **Incoming Task**: Receives messages from the client and routes them to plugins
-/// * **Outgoing Task**: Receives messages from plugins and sends them to the client
-/// 
-/// These tasks run until the connection is closed or an error occurs.
+/// 5. Run the reader (client to plugins) and the writer (outbox to client)
+/// 6. When either ends, clean up and emit player disconnected
 pub async fn handle_connection(
     stream: TcpStream,
     addr: SocketAddr,
     connection_manager: Arc<ConnectionManager>,
     horizon_event_system: Arc<EventSystem>,
+    settings: ListenerSettings,
 ) -> Result<(), ServerError> {
-    // Perform WebSocket handshake
-    let ws_stream = accept_async(stream)
-        .await
-        .map_err(|e| ServerError::Network(format!("WebSocket handshake failed: {e}")))?;
+    if settings.banned_ips.contains(&addr.ip()) {
+        debug!("Dropped a connection from banned address {}", addr.ip());
+        return Ok(());
+    }
+    match settings.tls.as_ref().map(|tls| tls.acceptor()) {
+        Some(acceptor) => {
+            let tls_stream = acceptor
+                .accept(stream)
+                .await
+                .map_err(|e| ServerError::Network(format!("TLS handshake failed: {e}")))?;
+            let ws_stream = accept_async(tls_stream)
+                .await
+                .map_err(|e| ServerError::Network(format!("WebSocket handshake failed: {e}")))?;
+            serve_websocket(ws_stream, addr, connection_manager, horizon_event_system, settings).await
+        }
+        None => {
+            let ws_stream = accept_async(stream)
+                .await
+                .map_err(|e| ServerError::Network(format!("WebSocket handshake failed: {e}")))?;
+            serve_websocket(ws_stream, addr, connection_manager, horizon_event_system, settings).await
+        }
+    }
+}
 
-    let (ws_sender, mut ws_receiver) = ws_stream.split();
-    let ws_sender = Arc::new(tokio::sync::Mutex::new(ws_sender));
-    let connection_id = connection_manager.add_connection(addr).await;
-    connection_manager.register_ws_sender(connection_id, ws_sender.clone()).await;
+/// Why a connection ended, as seen by its handler.
+#[derive(Debug)]
+enum Ended {
+    /// The client closed the connection or its stream ended.
+    ByClient,
+    /// The server closed it with this code and reason.
+    ByServer(CloseCode, String),
+    /// Writing to the client failed.
+    WriteFailed(String),
+    /// Every sender to the connection is gone (server shutting down).
+    SendersGone,
+}
+
+impl Ended {
+    fn disconnect_reason(&self) -> DisconnectReason {
+        match self {
+            Ended::ByClient => DisconnectReason::ClientDisconnect,
+            Ended::ByServer(CloseCode::Kicked, reason) => DisconnectReason::Kicked(reason.clone()),
+            Ended::ByServer(CloseCode::SlowClient, _) => DisconnectReason::SlowClient,
+            Ended::ByServer(CloseCode::IdleTimeout, _) => DisconnectReason::Timeout,
+            Ended::ByServer(code, reason) => {
+                DisconnectReason::Error(format!("{} ({}): {}", code.default_reason(), code.code(), reason))
+            }
+            Ended::WriteFailed(e) => DisconnectReason::Error(e.clone()),
+            Ended::SendersGone => DisconnectReason::ServerShutdown,
+        }
+    }
+}
+
+/// Serves an established WebSocket connection until it ends.
+///
+/// Generic over the stream so the same code serves plain and TLS connections.
+pub(crate) async fn serve_websocket<S>(
+    ws_stream: WebSocketStream<S>,
+    addr: SocketAddr,
+    connection_manager: Arc<ConnectionManager>,
+    horizon_event_system: Arc<EventSystem>,
+    settings: ListenerSettings,
+) -> Result<(), ServerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if connection_manager.connection_count() >= settings.max_connections {
+        let (mut sink, _) = ws_stream.split();
+        send_close(&mut sink, CloseCode::ServerFull, CloseCode::ServerFull.default_reason()).await;
+        return Ok(());
+    }
+    let (connection_id, mut outbox) = connection_manager
+        .open_connection_with(addr, settings.profile, settings.compression.clone())
+        .await;
 
     // Generate player ID and emit connection event
     let player_id = PlayerId::new();
-    connection_manager
-        .set_player_id(connection_id, player_id)
-        .await;
+    connection_manager.set_player_id(connection_id, player_id).await;
 
-    // Emit core infrastructure event
-    horizon_event_system
+    let connected = horizon_event_system
         .emit_core(
             "player_connected",
             &PlayerConnectedEvent {
@@ -89,100 +179,245 @@ pub async fn handle_connection(
                 timestamp: current_timestamp(),
             },
         )
-        .await
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        .await;
+    if let Err(e) = connected {
+        connection_manager.remove_connection(connection_id).await;
+        return Err(ServerError::Internal(e.to_string()));
+    }
 
-    // Register per-connection message channel for O(1) message delivery
-    let mut message_receiver = connection_manager.register_message_channel(connection_id).await;
-    let ws_sender_incoming = ws_sender.clone();
-    let ws_sender_outgoing = ws_sender.clone();
+    let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
     // Incoming message task - routes raw messages to plugins
     let incoming_task = {
         let connection_manager = connection_manager.clone();
         let horizon_event_system = horizon_event_system.clone();
-
+        let settings = settings.clone();
         async move {
+            let mut session = Session::new(
+                connection_id,
+                settings.profile,
+                settings.max_frame_size,
+                settings.max_decode_errors,
+            )
+            .with_compression(settings.compression.clone());
+            let mut closing = false;
             while let Some(msg) = ws_receiver.next().await {
-                match msg {
-                    Ok(Message::Text(text)) => {
-                        // Route raw message to plugins via events
-                        if let Err(e) = route_client_message(
-                            &text,
-                            connection_id,
-                            &connection_manager,
-                            &horizon_event_system,
-                        )
-                        .await
-                        {
-                            trace!("❌ Message routing error: {}", e);
-                        }
+                let payload = match msg {
+                    Ok(Message::Text(text)) => Bytes::from(text),
+                    Ok(Message::Binary(data)) => data,
+                    Ok(Message::Ping(data)) => {
+                        // Answered by the writer, ahead of queued frames.
+                        connection_manager.send_control(connection_id, Control::Pong(data));
+                        continue;
                     }
                     Ok(Message::Close(_)) => {
                         debug!("🔌 Client {} requested close", connection_id);
                         break;
                     }
-                    Ok(Message::Ping(data)) => {
-                        let mut ws_sender = ws_sender_incoming.lock().await;
-                        let _ = ws_sender.send(Message::Pong(data)).await;
-                    }
+                    Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => continue,
                     Err(e) => {
-                        error!("WebSocket error for connection {}: {}", connection_id, e);
+                        debug!("WebSocket error for connection {}: {}", connection_id, e);
                         break;
                     }
-                    _ => {}
+                };
+                if closing {
+                    // The writer is sending the close frame; nothing more is routed.
+                    continue;
+                }
+                let routed =
+                    route_client_frame(&payload, &mut session, &connection_manager, &horizon_event_system).await;
+                if let Routed::Close(code, reason) = routed {
+                    trace!("Closing connection {}: {:?} ({})", connection_id, code, reason);
+                    closing = true;
+                    let _ = connection_manager.close_connection(connection_id, code, Some(reason));
                 }
             }
+            Ended::ByClient
         }
     };
 
-    // Outgoing message task - receives directly from dedicated channel (O(1) complexity)
-    let outgoing_task = {
-        let ws_sender = ws_sender_outgoing;
-        async move {
-            while let Some(message) = message_receiver.recv().await {
-                let message_text = String::from_utf8_lossy(&message);
-                let mut ws_sender = ws_sender.lock().await;
-                // A client that stopped reading blocks this send on a full socket: the
-                // outbox cutting the connection is what ends it (see outbox.rs).
-                tokio::select! {
-                    sent = ws_sender.send(Message::Text(message_text.to_string().into())) => {
-                        if let Err(e) = sent {
-                            error!("Failed to send message: {}", e);
-                            break;
-                        }
-                    }
-                    _ = message_receiver.cut() => break,
-                }
-            }
-        }
+    // JSON listeners without compression send text frames, as they always have; every
+    // other listener binary.
+    let wire = Wire {
+        text_frames: settings.profile.format == Format::Json && !settings.compression.has_header(),
+        format: settings.profile.format,
+        compression: settings.compression.clone(),
+        batch_delay: settings.batch_delay,
+        connection_manager: connection_manager.clone(),
     };
+    let outgoing_task = write_frames(&mut ws_sender, &mut outbox, &wire);
 
     // Run both tasks concurrently until one completes
-    tokio::select! {
-        _ = incoming_task => {},
-        _ = outgoing_task => {},
+    let ended = tokio::select! {
+        ended = incoming_task => ended,
+        ended = outgoing_task => ended,
+    };
+    match &ended {
+        Ended::WriteFailed(e) => error!("Failed to write to connection {}: {}", connection_id, e),
+        Ended::ByServer(code, reason) => {
+            debug!("Connection {} closed by the server: {:?} ({})", connection_id, code, reason)
+        }
+        _ => {}
     }
 
     // Emit disconnection event
-    if let Some(player_id) = connection_manager.get_player_id(connection_id).await {
-        horizon_event_system
+    let disconnected = match connection_manager.get_player_id(connection_id).await {
+        Some(player_id) => horizon_event_system
             .emit_core(
                 "player_disconnected",
                 &PlayerDisconnectedEvent {
                     player_id,
                     connection_id: connection_id.to_string(),
-                    reason: DisconnectReason::ClientDisconnect,
+                    reason: ended.disconnect_reason(),
                     timestamp: current_timestamp(),
                 },
             )
             .await
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
+            .map_err(|e| ServerError::Internal(e.to_string())),
+        None => Ok(()),
+    };
+
+    connection_manager.remove_connection(connection_id).await;
+    disconnected
+}
+
+/// Writes the connection's outbox to the client until the connection ends.
+///
+/// Control items go first. Frames already queued are written together and flushed
+/// once. A write blocked on a client that stopped reading is abandoned as soon as the
+/// outbox cuts the connection.
+/// How a connection's frames go on the wire.
+struct Wire {
+    text_frames: bool,
+    format: Format,
+    compression: Arc<ListenerCompression>,
+    batch_delay: Duration,
+    connection_manager: Arc<ConnectionManager>,
+}
+
+async fn write_frames<W>(sink: &mut W, outbox: &mut OutboxReceiver, wire: &Wire) -> Ended
+where
+    W: Sink<Message, Error = tungstenite::Error> + Unpin,
+{
+    let cut = outbox.cut_signal();
+    loop {
+        match outbox.next().await {
+            Next::Control(Control::Pong(data)) => {
+                if let Err(e) = sink.send(Message::Pong(data)).await {
+                    return Ended::WriteFailed(e.to_string());
+                }
+            }
+            Next::Control(Control::Close(code, reason)) => {
+                send_close(sink, code, &reason).await;
+                return Ended::ByServer(code, reason);
+            }
+            Next::Frame(first) => {
+                if !first.wrapped && wire.compression.has_header() && !wire.batch_delay.is_zero() {
+                    // Give more small frames a chance to join this batch.
+                    tokio::time::sleep(wire.batch_delay).await;
+                }
+                let mut batch = vec![first];
+                while batch.len() < MAX_FRAMES_PER_FLUSH && !outbox.has_control() {
+                    match outbox.try_next_frame() {
+                        Some(frame) => batch.push(frame),
+                        None => break,
+                    }
+                }
+                // WebSocket has no datagrams: unreliable frames go reliably, counted.
+                let stats = wire.connection_manager.delivery_stats();
+                for queued in &batch {
+                    if queued.frame.delivery == horizon_event_system::Delivery::Unreliable {
+                        crate::connection::manager::DeliveryStats::count(&stats.sent_reliably);
+                    }
+                }
+                let frames = batch.into_iter().map(|q| (q.frame.bytes, q.wrapped)).collect();
+                let batch = wire.compression.wire_frames(wire.format, frames);
+                let written = tokio::select! {
+                    written = write_batch(sink, batch, wire.text_frames) => written,
+                    _ = cut.cut() => Err(None),
+                };
+                match written {
+                    Ok(()) => {}
+                    Err(Some(e)) => return Ended::WriteFailed(e.to_string()),
+                    Err(None) => return slow_client(sink).await,
+                }
+            }
+            Next::Cut => return slow_client(sink).await,
+            Next::Closed => return Ended::SendersGone,
+        }
+    }
+}
+
+/// Feeds every frame of `batch`, then flushes once. `Err(None)` is never returned here;
+/// it stands for "abandoned" in the caller.
+async fn write_batch<W>(sink: &mut W, batch: Vec<Bytes>, text_frames: bool) -> Result<(), Option<tungstenite::Error>>
+where
+    W: Sink<Message, Error = tungstenite::Error> + Unpin,
+{
+    for bytes in batch {
+        let message = if text_frames { frame_message(Outbound::reliable(bytes)) } else { Message::Binary(bytes) };
+        sink.feed(message).await.map_err(Some)?;
+    }
+    sink.flush().await.map_err(Some)
+}
+
+async fn slow_client<W>(sink: &mut W) -> Ended
+where
+    W: Sink<Message, Error = tungstenite::Error> + Unpin,
+{
+    let code = CloseCode::SlowClient;
+    warn!("Closing a connection that does not read its frames: {}", code.default_reason());
+    send_close(sink, code, code.default_reason()).await;
+    Ended::ByServer(code, code.default_reason().to_string())
+}
+
+/// Sends a close frame, giving up after [`CLOSE_TIMEOUT`] on a client that does not read.
+async fn send_close<W>(sink: &mut W, code: CloseCode, reason: &str)
+where
+    W: Sink<Message, Error = tungstenite::Error> + Unpin,
+{
+    let frame = Message::Close(Some(CloseFrame {
+        code: WsCloseCode::from(code.code()),
+        reason: Utf8Bytes::from(reason),
+    }));
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, sink.send(frame)).await;
+}
+
+/// The WebSocket message carrying a frame on a JSON listener: text when it is valid
+/// UTF-8 (every JSON frame), binary otherwise. Before, every frame went through `from_utf8_lossy`, which
+/// corrupted binary payloads.
+fn frame_message(frame: Outbound) -> Message {
+    let bytes = frame.bytes;
+    if std::str::from_utf8(&bytes).is_ok() {
+        // SAFETY: checked just above.
+        Message::Text(unsafe { Utf8Bytes::from_bytes_unchecked(bytes) })
+    } else {
+        Message::Binary(bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn utf8_frames_go_as_text_and_others_as_binary() {
+        let text = frame_message(Outbound::reliable(br#"{"a":1}"#.to_vec()));
+        assert_eq!(text, Message::Text(Utf8Bytes::from(r#"{"a":1}"#)));
+        let binary = frame_message(Outbound::reliable(vec![0xff, 0x00, 0xfe]));
+        assert_eq!(binary, Message::Binary(Bytes::from(vec![0xff, 0x00, 0xfe])));
     }
 
-    // Cleanup: remove connection and message channel
-    connection_manager.remove_connection(connection_id).await;
-    connection_manager.remove_ws_sender(connection_id).await;
-    connection_manager.remove_message_channel(connection_id).await;
-    Ok(())
+    #[test]
+    fn close_codes_map_to_disconnect_reasons() {
+        assert!(matches!(
+            Ended::ByServer(CloseCode::Kicked, "bye".into()).disconnect_reason(),
+            DisconnectReason::Kicked(r) if r == "bye"
+        ));
+        assert!(matches!(
+            Ended::ByServer(CloseCode::SlowClient, String::new()).disconnect_reason(),
+            DisconnectReason::SlowClient
+        ));
+        assert!(matches!(Ended::ByClient.disconnect_reason(), DisconnectReason::ClientDisconnect));
+    }
 }

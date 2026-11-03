@@ -8,9 +8,13 @@ mod stats;
 mod cache;
 mod tests;
 mod path_router;
+mod typed_client;
 
 // Re-export all public items from submodules
-pub use client::{ClientConnectionRef, ClientResponseSender, ClientConnectionInfo};
+pub use client::{
+    ClientConnectionRef, ClientResponseSender, ClientConnectionInfo, Delivery, ListenerProfile, Outbound,
+    Transport,
+};
 pub use core::EventSystem;
 pub use emitters::*;
 pub use handlers::*;

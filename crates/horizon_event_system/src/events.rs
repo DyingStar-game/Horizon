@@ -740,6 +740,7 @@ pub struct RawClientMessageEvent {
 ///     data: serde_json::json!({"x": 100.0, "y": 200.0, "z": 300.0}),
 ///     priority: ReplicationPriority::Critical,
 ///     timestamp: current_timestamp(),
+///     format: Default::default(),
 /// }).await?;
 /// #     Ok(())
 /// # }
@@ -760,6 +761,17 @@ pub struct GorcEvent {
     pub priority: String, // We'll use String to avoid circular dependency
     /// Unix timestamp when the event was created
     pub timestamp: u64,
+    /// Format of `data`: JSON, or bitcode when the event came from a bitcode client
+    #[serde(default)]
+    pub format: horizon_protocol::Format,
+}
+
+impl GorcEvent {
+    /// Decodes `data` in its format, through serde.
+    pub fn decode_data<T: serde::de::DeserializeOwned>(&self) -> Result<T, EventError> {
+        horizon_protocol::payload::decode_serde(self.format, &self.data)
+            .map_err(|e| EventError::HandlerExecution(format!("Invalid {} payload: {e}", self.format)))
+    }
 }
 
 /// Destination enum for GORC event emission

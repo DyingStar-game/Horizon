@@ -54,6 +54,15 @@ pub trait GorcZoneData: Send + Sync + std::fmt::Debug + Clone + serde::Serialize
     fn deserialize_zone_data(data: &[u8]) -> Result<Self, Box<dyn std::error::Error>> where Self: Sized {
         Ok(serde_json::from_slice(data)?)
     }
+
+    /// Serialize this zone data in a client's message format: JSON through
+    /// [`serialize_zone_data`](GorcZoneData::serialize_zone_data), bitcode through serde.
+    fn serialize_zone_data_as(&self, format: crate::Format) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        match format {
+            crate::Format::Json => self.serialize_zone_data(),
+            crate::Format::Bitcode => Ok(crate::protocol::payload::encode_serde(format, self)?),
+        }
+    }
 }
 
 /// Macro for implementing GorcObject with type-based zone assignment
@@ -108,6 +117,17 @@ macro_rules! impl_gorc_object {
                     $(
                         $zone => {
                             self.$field.serialize_zone_data()
+                        }
+                    )*
+                    _ => Err("Invalid channel for this object type".into())
+                }
+            }
+
+            fn serialize_for_layer_as(&self, layer: &$crate::ReplicationLayer, format: $crate::Format) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+                match layer.channel {
+                    $(
+                        $zone => {
+                            self.$field.serialize_zone_data_as(format)
                         }
                     )*
                     _ => Err("Invalid channel for this object type".into())

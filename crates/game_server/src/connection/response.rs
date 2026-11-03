@@ -4,8 +4,8 @@
 //! integrates the connection manager with the event system for sending
 //! responses back to clients.
 
-use super::manager::ConnectionManager;
-use horizon_event_system::{ClientResponseSender, PlayerId, AuthenticationStatus};
+use super::{manager::ConnectionManager, outbox::Pushed};
+use horizon_event_system::{AuthenticationStatus, ClientResponseSender, ListenerProfile, Outbound, PlayerId};
 use std::sync::Arc;
 
 /// Implementation of `ClientResponseSender` for the game server.
@@ -63,22 +63,52 @@ impl ClientResponseSender for GameServerResponseSender {
     /// A future that resolves to `Ok(())` if the message was queued successfully,
     /// or an error string if the player is not found or not connected.
     fn send_to_client(&self, player_id: PlayerId, data: Vec<u8>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
-        let connection_manager = self.connection_manager.clone();
-        Box::pin(async move {
-            tracing::debug!("🔧 GameServerResponseSender: Attempting to send to player {}", player_id);
-            if let Some(connection_id) = connection_manager.get_connection_id_by_player(player_id).await {
-                tracing::debug!("🔧 GameServerResponseSender: Found connection {} for player {}", connection_id, player_id);
-                connection_manager.send_to_connection(connection_id, data).await;
-                tracing::debug!("🔧 GameServerResponseSender: Message sent to connection {}", connection_id);
-                Ok(())
-            } else {
-                // debug!, not error!: this is the normal outcome whenever anything is
-                // sent to a player who just disconnected, and it fires once per
-                // replicated event. See the matching note in emitters.rs.
-                tracing::debug!("🔧 GameServerResponseSender: Player {} not found or not connected", player_id);
-                Err(format!("Player {} not found or not connected", player_id))
-            }
-        })
+        self.send_frame(player_id, Outbound::reliable(data))
+    }
+
+    /// Queues an encoded frame for a player without copying its bytes.
+    fn send_frame(&self, player_id: PlayerId, frame: Outbound) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        let result = match self.connection_manager.connection_of(player_id) {
+            Some(connection_id) => match self.connection_manager.send_frame(connection_id, frame) {
+                Pushed::Queued | Pushed::Deferred => Ok(()),
+                Pushed::Cut => Err(format!("Player {} was cut for reading too slowly", player_id)),
+                Pushed::Closed => Err(format!("Player {} is disconnecting", player_id)),
+            },
+            None => Err(format!("Player {} not found or not connected", player_id)),
+        };
+        if let Err(e) = &result {
+            tracing::debug!("🔧 GameServerResponseSender: {}", e);
+        }
+        Box::pin(async move { result })
+    }
+
+    /// The round-trip time measured by the player's transport (WebTransport only).
+    fn connection_rtt(&self, player_id: PlayerId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<std::time::Duration>> + Send + '_>> {
+        let rtt = self
+            .connection_manager
+            .connection_of(player_id)
+            .and_then(|connection_id| self.connection_manager.transport_info(connection_id))
+            .and_then(|info| info.rtt());
+        Box::pin(async move { rtt })
+    }
+
+    /// The largest datagram the player's connection takes (WebTransport only).
+    fn max_datagram_size(&self, player_id: PlayerId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<usize>> + Send + '_>> {
+        let size = self
+            .connection_manager
+            .connection_of(player_id)
+            .and_then(|connection_id| self.connection_manager.transport_info(connection_id))
+            .and_then(|info| info.max_datagram_size());
+        Box::pin(async move { size })
+    }
+
+    /// The listener the player is connected through.
+    fn connection_profile(&self, player_id: PlayerId) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ListenerProfile>> + Send + '_>> {
+        let profile = self
+            .connection_manager
+            .connection_of(player_id)
+            .and_then(|connection_id| self.connection_manager.connection_profile(connection_id));
+        Box::pin(async move { profile })
     }
 
     /// Checks if a player connection is currently active.

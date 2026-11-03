@@ -62,6 +62,21 @@ pub trait GorcObject: Send + Sync + Any + std::fmt::Debug {
     /// Serialize data for a specific replication layer
     fn serialize_for_layer(&self, layer: &ReplicationLayer) -> Result<Vec<u8>, Box<dyn std::error::Error>>;
     
+    /// Serialize data for a replication layer in a client's message format.
+    ///
+    /// The default sends [`serialize_for_layer`](GorcObject::serialize_for_layer) in
+    /// both formats, which is JSON for most objects: bitcode clients then receive JSON
+    /// bytes in `zone_data`. Objects that serve bitcode clients override it; objects
+    /// declared with `impl_gorc_object!` do so automatically.
+    fn serialize_for_layer_as(
+        &self,
+        layer: &ReplicationLayer,
+        format: horizon_protocol::Format,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let _ = format;
+        self.serialize_for_layer(layer)
+    }
+    
     /// Get all replication layers for this object type
     fn get_layers(&self) -> Vec<ReplicationLayer>;
     
@@ -286,6 +301,15 @@ pub struct GorcInstanceManager {
     virtualization_manager: Arc<VirtualizationManager>,
     /// Global statistics
     stats: Arc<RwLock<InstanceManagerStats>>,
+    /// Wire handle of each object: the same for every client, so frames naming an
+    /// object are encoded once for all its subscribers.
+    handles: dashmap::DashMap<GorcObjectId, u32>,
+    /// Object of each wire handle, for frames coming from clients.
+    handle_objects: dashmap::DashMap<u32, GorcObjectId>,
+    /// Next wire handle to give.
+    next_handle: std::sync::atomic::AtomicU32,
+    /// Sequence counter per (object, channel), for clients to order unreliable frames.
+    sequences: dashmap::DashMap<(GorcObjectId, u8), u16>,
 }
 
 impl GorcInstanceManager {
@@ -308,6 +332,10 @@ impl GorcInstanceManager {
             zone_size_warnings: Arc::new(RwLock::new(HashMap::new())),
             virtualization_manager,
             stats: Arc::new(RwLock::new(InstanceManagerStats::default())),
+            handles: dashmap::DashMap::new(),
+            handle_objects: dashmap::DashMap::new(),
+            next_handle: std::sync::atomic::AtomicU32::new(1),
+            sequences: dashmap::DashMap::new(),
         };
 
         // Initialize spatial index with default region in the background
@@ -350,6 +378,13 @@ impl GorcInstanceManager {
         
         let layers_for_warning = object.get_layers();
         let mut instance = ObjectInstance::new(object_id, Box::new(object));
+        
+        // Wire handle: the same for every client (see `handles`).
+        if !self.handles.contains_key(&object_id) {
+            let handle = self.next_handle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.handles.insert(object_id, handle);
+            self.handle_objects.insert(handle, object_id);
+        }
         
         debug!("🔧 REGISTER[{}]: Phase 1 - acquiring player_positions read lock", object_id);
         // Snapshot player positions FIRST (short read lock)
@@ -421,6 +456,10 @@ impl GorcInstanceManager {
         };
 
         if let Some(type_name) = type_name {
+            if let Some((_, handle)) = self.handles.remove(&object_id) {
+                self.handle_objects.remove(&handle);
+            }
+            self.sequences.retain(|(id, _), _| *id != object_id);
             {
                 let mut type_registry = self.type_registry.write().await;
                 if let Some(type_set) = type_registry.get_mut(&type_name) {
@@ -734,6 +773,28 @@ impl GorcInstanceManager {
         }
     }
 
+    /// The wire handle of an object (see [`horizon_protocol::ServerFrame::ZoneEnter`]).
+    pub fn object_handle(&self, object_id: GorcObjectId) -> Option<u32> {
+        self.handles.get(&object_id).map(|h| *h)
+    }
+
+    /// The object a wire handle stands for.
+    pub fn object_by_handle(&self, handle: u32) -> Option<GorcObjectId> {
+        self.handle_objects.get(&handle).map(|id| *id)
+    }
+
+    /// The next sequence number of an object's channel (wrapping).
+    pub fn next_sequence(&self, object_id: GorcObjectId, channel: u8) -> u16 {
+        let mut seq = self.sequences.entry((object_id, channel)).or_insert(0);
+        *seq = seq.wrapping_add(1);
+        *seq
+    }
+
+    /// The type name of an object, without cloning the object.
+    pub async fn get_object_type(&self, object_id: GorcObjectId) -> Option<String> {
+        self.objects.get(&object_id).map(|instance| instance.type_name.clone())
+    }
+
     /// Get an object instance by ID
     pub async fn get_object(&self, object_id: GorcObjectId) -> Option<ObjectInstance> {
         // Use DashMap get for lock-free read access
@@ -911,6 +972,18 @@ impl GorcInstanceManager {
     }
     
     
+    /// Current object state for a layer, in a client's message format.
+    pub async fn get_object_state_for_layer_as(
+        &self,
+        object_id: GorcObjectId,
+        channel: u8,
+        format: horizon_protocol::Format,
+    ) -> Option<Vec<u8>> {
+        let instance = self.objects.get(&object_id)?;
+        let layer = instance.cached_layers.iter().find(|l| l.channel == channel)?;
+        instance.object.serialize_for_layer_as(layer, format).ok()
+    }
+
     /// Get current object state for a specific layer/channel
     pub async fn get_object_state_for_layer(&self, object_id: GorcObjectId, channel: u8) -> Option<Vec<u8>> {
         // Use DashMap get for lock-free read access

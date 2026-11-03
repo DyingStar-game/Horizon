@@ -1,147 +1,222 @@
 //! Connection manager for tracking and managing client connections.
 //!
 //! This module provides the central management system for all client connections,
-//! handling connection lifecycle, player ID assignment, and message broadcasting.
+//! handling connection lifecycle, player ID assignment, and message delivery.
 
-const MESSAGE_CHANNEL_CAPACITY: usize = 1000;
-
-use super::{client::ClientConnection, outbox::{self, Outbox, OutboxReceiver, Pushed}, ConnectionId};
-use horizon_event_system::{PlayerId, AuthenticationStatus};
+use super::{
+    client::ClientConnection,
+    compress::ListenerCompression,
+    outbox::{outbox, Control, Outbox, OutboxReceiver, Pushed, DEFAULT_CHANNEL_CAPACITY},
+    CloseCode, ConnectionId,
+};
 use dashmap::DashMap;
+use horizon_event_system::{AuthenticationStatus, ListenerProfile, Outbound, PlayerId};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::info;
-use futures_util::sink::SinkExt;
-use futures_util::stream::SplitSink;
-use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
+use tracing::{debug, info};
+
+/// What the server holds to reach one connection.
+/// What a transport knows about a live connection.
+pub trait TransportInfo: Send + Sync + std::fmt::Debug {
+    /// The round-trip time the transport measures.
+    fn rtt(&self) -> Option<std::time::Duration>;
+    /// The largest datagram the connection accepts now, if it has datagrams.
+    fn max_datagram_size(&self) -> Option<usize>;
+}
+
+/// What happened to unreliable frames, for metrics.
+#[derive(Debug, Default)]
+pub struct DeliveryStats {
+    /// Sent as datagrams.
+    pub datagrams_sent: std::sync::atomic::AtomicU64,
+    /// Dropped because the connection was behind.
+    pub dropped_behind: std::sync::atomic::AtomicU64,
+    /// Dropped because they waited longer than their maximum age.
+    pub dropped_too_old: std::sync::atomic::AtomicU64,
+    /// Sent reliably instead: no datagrams on the transport, or too large for one.
+    pub sent_reliably: std::sync::atomic::AtomicU64,
+}
+
+impl DeliveryStats {
+    /// Adds one to a counter.
+    pub fn count(counter: &std::sync::atomic::AtomicU64) {
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A counter's value.
+    pub fn get(counter: &std::sync::atomic::AtomicU64) -> u64 {
+        counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConnectionHandle {
+    outbox: Outbox,
+    profile: ListenerProfile,
+    compression: Arc<ListenerCompression>,
+    transport: Option<Arc<dyn TransportInfo>>,
+}
+
+impl ConnectionHandle {
+    /// Queues a frame: large ones wrapped now (compressed once for all recipients),
+    /// small ones left for the writer to batch.
+    fn push(&self, frame: Outbound) -> Pushed {
+        match self.compression.wrap_large(&frame.bytes) {
+            Some(bytes) => self.outbox.push_wrapped(Outbound { bytes, delivery: frame.delivery }),
+            None => self.outbox.push(frame),
+        }
+    }
+}
 
 /// Central manager for all client connections.
-/// 
-/// The `ConnectionManager` tracks active connections, assigns unique IDs,
-/// manages player associations, and provides message broadcasting capabilities.
-/// It uses async-safe data structures to handle concurrent access from multiple
-/// connection handlers.
-/// 
+///
+/// The `ConnectionManager` tracks active connections, assigns unique IDs, manages player
+/// associations, and queues frames for each connection.
+///
 /// # Architecture
-/// 
-/// * Uses `RwLock<HashMap>` for thread-safe connection storage
-/// * Implements atomic connection ID generation
-/// * Per-connection mpsc channels for O(1) message delivery
-/// * Maintains bidirectional player-connection mapping
+///
+/// * Every connection has its own [`Outbox`]: a slow client never delays the others and
+///   never loses a reliable frame (see the `outbox` module).
+/// * Players are indexed by ID, so delivering to a player is a map lookup, not a scan.
+/// * Kicking a connection asks its writer to send the close frame; the connection's
+///   handler then cleans up and emits `player_disconnected` like any other disconnect.
 #[derive(Debug)]
 pub struct ConnectionManager {
     /// Map of connection ID to client connection information
     connections: Arc<RwLock<HashMap<ConnectionId, ClientConnection>>>,
-    ws_senders: Arc<RwLock<HashMap<ConnectionId, Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>>>>>>,
-    
+
+    /// How to reach each connection's writer.
+    handles: DashMap<ConnectionId, ConnectionHandle>,
+
+    /// Which connection each player is on.
+    players: DashMap<PlayerId, ConnectionId>,
+
     /// Atomic counter for generating unique connection IDs
     next_id: Arc<std::sync::atomic::AtomicUsize>,
-    
-    /// Per-connection outboxes for O(1) message delivery (never dropping, see outbox.rs)
-    message_senders: Arc<RwLock<HashMap<ConnectionId, Outbox>>>,
 
-    /// Player → connection index, kept by set_player_id / remove_connection. Every
-    /// send_to_client resolves its player here: the linear scan of `connections` it
-    /// replaces was most of the LOD delivery thread at 1256 players (80k sends/s).
-    player_connections: Arc<DashMap<PlayerId, ConnectionId>>,
+    /// Frames each connection's channel holds before its backlog takes over.
+    channel_capacity: usize,
+
+    /// What became of unreliable frames, all connections together.
+    delivery_stats: DeliveryStats,
+}
+
+impl Default for ConnectionManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ConnectionManager {
     /// Creates a new connection manager.
-    /// 
-    /// Initializes the internal data structures with per-connection
-    /// message channels for efficient O(1) message delivery.
-    /// 
-    /// # Returns
-    /// 
-    /// A new `ConnectionManager` instance ready to handle connections.
     pub fn new() -> Self {
+        Self::with_channel_capacity(DEFAULT_CHANNEL_CAPACITY)
+    }
+
+    /// Creates a connection manager whose connections hold `capacity` frames in their fast
+    /// path before queuing the rest in their backlog.
+    pub fn with_channel_capacity(capacity: usize) -> Self {
         Self {
             connections: Arc::new(RwLock::new(HashMap::new())),
-            ws_senders: Arc::new(RwLock::new(HashMap::new())),
+            handles: DashMap::new(),
+            players: DashMap::new(),
             next_id: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            message_senders: Arc::new(RwLock::new(HashMap::new())),
-            player_connections: Arc::new(DashMap::new()),
+            channel_capacity: capacity,
+            delivery_stats: DeliveryStats::default(),
         }
     }
 
-    /// Adds a new connection and returns its unique ID.
-    /// 
-    /// Creates a new connection entry with the provided remote address
-    /// and assigns it a unique connection ID for tracking.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `remote_addr` - The network address of the connecting client
-    /// 
-    /// # Returns
-    /// 
-    /// A unique `ConnectionId` assigned to this connection.
-    pub async fn add_connection(&self, remote_addr: SocketAddr) -> ConnectionId {
+    /// Registers a new connection and returns its ID with the receiving half of its
+    /// outbox, which the connection's writer owns.
+    pub async fn open_connection(
+        &self,
+        remote_addr: SocketAddr,
+        profile: ListenerProfile,
+    ) -> (ConnectionId, OutboxReceiver) {
+        self.open_connection_with(remote_addr, profile, Arc::new(ListenerCompression::none()))
+            .await
+    }
+
+    /// Like [`open_connection`](Self::open_connection), for a listener with compression.
+    pub async fn open_connection_with(
+        &self,
+        remote_addr: SocketAddr,
+        profile: ListenerProfile,
+        compression: Arc<ListenerCompression>,
+    ) -> (ConnectionId, OutboxReceiver) {
         let connection_id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (tx, rx) = outbox(connection_id, self.channel_capacity);
+        self.handles
+            .insert(connection_id, ConnectionHandle { outbox: tx, profile, compression, transport: None });
         let connection = ClientConnection::new(remote_addr);
-        let mut connections = self.connections.write().await;
-        connections.insert(connection_id, connection);
+        self.connections.write().await.insert(connection_id, connection);
         info!("🔗 Connection {} from {}", connection_id, remote_addr);
+        (connection_id, rx)
+    }
+
+    /// Adds a new connection and returns its unique ID.
+    ///
+    /// The connection has no writer: frames sent to it are not delivered. This is meant
+    /// for bookkeeping and tests; network listeners use [`open_connection`].
+    ///
+    /// [`open_connection`]: ConnectionManager::open_connection
+    pub async fn add_connection(&self, remote_addr: SocketAddr) -> ConnectionId {
+        let (connection_id, _rx) = self
+            .open_connection(remote_addr, ListenerProfile::default())
+            .await;
         connection_id
     }
 
-    /// Register the WebSocket sender for a connection
-    pub async fn register_ws_sender(&self, connection_id: ConnectionId, ws_sender: Arc<tokio::sync::Mutex<SplitSink<WebSocketStream<tokio::net::TcpStream>, Message>>>) {
-        let mut senders = self.ws_senders.write().await;
-        senders.insert(connection_id, ws_sender);
-    }
-
-    /// Remove the WebSocket sender for a connection
-    pub async fn remove_ws_sender(&self, connection_id: ConnectionId) {
-        let mut senders = self.ws_senders.write().await;
-        senders.remove(&connection_id);
+    /// Asks a connection to close with `code`. Its writer sends the close frame, then the
+    /// connection's handler removes it and emits `player_disconnected`.
+    pub fn close_connection(
+        &self,
+        connection_id: ConnectionId,
+        code: CloseCode,
+        reason: Option<String>,
+    ) -> Result<(), String> {
+        let handle = self
+            .handles
+            .get(&connection_id)
+            .ok_or_else(|| format!("Connection {connection_id} not found"))?;
+        let reason = reason.unwrap_or_else(|| code.default_reason().to_string());
+        if handle.outbox.control(Control::Close(code, reason)) {
+            Ok(())
+        } else {
+            Err(format!("Connection {connection_id} is already closing"))
+        }
     }
 
     /// Kick (disconnect) a connection by ID, sending a close frame
-    pub async fn kick_connection(&self, connection_id: ConnectionId, reason: Option<String>) -> Result<(), String> {
-        let senders = self.ws_senders.read().await;
-        if let Some(ws_sender) = senders.get(&connection_id) {
-            let mut ws_sender = ws_sender.lock().await;
-            use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
-            let close_msg = Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame {
-                code: CloseCode::Normal,
-                reason: reason.unwrap_or_else(|| "Kicked by server".into()).into(),
-            }));
-            let _ = ws_sender.send(close_msg).await;
-        }
-        drop(senders);
-        self.remove_connection(connection_id).await;
-        self.remove_ws_sender(connection_id).await;
-        Ok(())
+    pub async fn kick_connection(
+        &self,
+        connection_id: ConnectionId,
+        reason: Option<String>,
+    ) -> Result<(), String> {
+        self.close_connection(connection_id, CloseCode::Kicked, reason)
     }
 
     /// Kick (disconnect) a player by PlayerId
     pub async fn kick_player(&self, player_id: PlayerId, reason: Option<String>) -> Result<(), String> {
-        if let Some(conn_id) = self.get_connection_id_by_player(player_id).await {
-            self.kick_connection(conn_id, reason).await
-        } else {
-            Err("Player not connected".to_string())
+        match self.get_connection_id_by_player(player_id).await {
+            Some(conn_id) => self.kick_connection(conn_id, reason).await,
+            None => Err("Player not connected".to_string()),
         }
     }
 
     /// Removes a connection from the manager.
-    /// 
-    /// Cleans up the connection entry and logs the disconnection.
-    /// This should be called when a client disconnects or times out.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `connection_id` - The ID of the connection to remove
+    ///
+    /// Called by the connection's handler once the connection has ended.
     pub async fn remove_connection(&self, connection_id: ConnectionId) {
-        let mut connections = self.connections.write().await;
-        if let Some(connection) = connections.remove(&connection_id) {
+        self.handles.remove(&connection_id);
+        let removed = self.connections.write().await.remove(&connection_id);
+        if let Some(connection) = removed {
             if let Some(player_id) = connection.player_id {
-                self.player_connections.remove_if(&player_id, |_, conn| *conn == connection_id);
+                self.players.remove_if(&player_id, |_, conn| *conn == connection_id);
             }
             info!(
                 "❌ Connection {} from {} disconnected",
@@ -151,155 +226,119 @@ impl ConnectionManager {
     }
 
     /// Associates a player ID with a connection.
-    /// 
-    /// This is typically called after successful authentication or
-    /// when a player is assigned to a connection.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `connection_id` - The connection to update
-    /// * `player_id` - The player ID to assign
+    ///
+    /// This is typically called after successful authentication or when a player is
+    /// assigned to a connection. A connection has one player: assigning a new one
+    /// replaces the old one.
     pub async fn set_player_id(&self, connection_id: ConnectionId, player_id: PlayerId) {
         let mut connections = self.connections.write().await;
         if let Some(connection) = connections.get_mut(&connection_id) {
-            if let Some(previous) = connection.player_id.replace(player_id) {
-                self.player_connections.remove_if(&previous, |_, conn| *conn == connection_id);
+            if let Some(old) = connection.player_id.replace(player_id) {
+                self.players.remove_if(&old, |_, conn| *conn == connection_id);
             }
-            self.player_connections.insert(player_id, connection_id);
+            self.players.insert(player_id, connection_id);
         }
     }
 
     /// Retrieves the player ID associated with a connection.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `connection_id` - The connection to look up
-    /// 
-    /// # Returns
-    /// 
-    /// The associated `PlayerId` if found, or `None` if the connection
-    /// doesn't exist or doesn't have a player assigned.
     pub async fn get_player_id(&self, connection_id: ConnectionId) -> Option<PlayerId> {
         let connections = self.connections.read().await;
         connections.get(&connection_id).and_then(|c| c.player_id)
     }
 
-    /// Registers a message channel for a connection.
-    /// 
-    /// Creates a new per-connection mpsc channel and returns the receiver.
-    /// This allows O(1) message delivery without filtering overhead.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `connection_id` - The connection to register a channel for
-    /// 
-    /// # Returns
-    /// 
-    /// The receiver of the messages targeted to this connection: a bounded channel with
-    /// a backlog behind it, so a slow client loses nothing (see outbox.rs).
-    pub async fn register_message_channel(&self, connection_id: ConnectionId) -> OutboxReceiver {
-    let (sender, receiver) = outbox::outbox(connection_id, MESSAGE_CHANNEL_CAPACITY);
-    let mut senders = self.message_senders.write().await;
-    senders.insert(connection_id, sender);
-    tracing::debug!("📬 Registered message channel for connection {} (capacity: {}, then backlog)", connection_id, MESSAGE_CHANNEL_CAPACITY);
-    receiver
-    }
-
-    /// Removes the message channel for a connection.
-    /// 
-    /// This should be called during connection cleanup to prevent
-    /// memory leaks from unused channels.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `connection_id` - The connection whose channel should be removed
-    pub async fn remove_message_channel(&self, connection_id: ConnectionId) {
-        let mut senders = self.message_senders.write().await;
-        senders.remove(&connection_id);
-        tracing::debug!("📭 Removed message channel for connection {}", connection_id);
-    }
-
-    /// Sends a message to a specific connection.
-    /// 
-    /// Uses direct HashMap lookup for O(1) message delivery to the
-    /// connection's dedicated mpsc channel.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `connection_id` - The target connection
-    /// * `message` - The message data to send
-    pub async fn send_to_connection(&self, connection_id: ConnectionId, message: Vec<u8>) {
-        let senders = self.message_senders.read().await;
-        if let Some(sender) = senders.get(&connection_id) {
-            // Queued or deferred: delivered either way. Cut: the outbox said why, once.
-            if sender.push(message) == Pushed::Closed {
-                tracing::debug!("Connection {} is closing: message not sent", connection_id);
-            }
-        } else {
-            tracing::warn!("Attempted to send message to non-existent connection {}", connection_id);
+    /// Queues a frame for a specific connection, without waiting.
+    pub fn send_frame(&self, connection_id: ConnectionId, frame: Outbound) -> Pushed {
+        match self.handles.get(&connection_id) {
+            Some(handle) => handle.push(frame),
+            None => Pushed::Closed,
         }
+    }
+
+    /// Queues a reliable message for a specific connection.
+    pub async fn send_to_connection(&self, connection_id: ConnectionId, message: Vec<u8>) {
+        let pushed = self.send_frame(connection_id, Outbound::reliable(message));
+        if !pushed.is_accepted() {
+            debug!("Message to connection {} not delivered: {:?}", connection_id, pushed);
+        }
+    }
+
+    /// Hands a control item (a pong, a close request) to a connection's writer.
+    pub fn send_control(&self, connection_id: ConnectionId, item: Control) -> bool {
+        self.handles
+            .get(&connection_id)
+            .map(|handle| handle.outbox.control(item))
+            .unwrap_or(false)
     }
 
     /// Broadcasts a message to all currently connected clients.
-    /// 
-    /// Sends the same message to every active connection using their
-    /// dedicated mpsc channels for O(N) delivery.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `message` - The message data to broadcast to all clients
-    /// 
+    ///
+    /// The frame's bytes are shared between connections, not copied.
+    ///
     /// # Returns
-    /// 
-    /// The number of connections that the message was sent to.
+    ///
+    /// The number of connections the message was queued for.
     pub async fn broadcast_to_all(&self, message: Vec<u8>) -> usize {
-        // Collect senders first to avoid holding the lock during send
-        let senders_vec: Vec<(ConnectionId, Outbox)> = {
-            let senders = self.message_senders.read().await;
-            senders.iter()
-                .map(|(connection_id, sender)| (*connection_id, sender.clone()))
-                .collect()
-        };
+        self.broadcast_frame(Outbound::reliable(message))
+    }
 
-        let mut sent_count = 0;
-        for (connection_id, sender) in senders_vec {
-            match sender.push(message.clone()) {
-                Pushed::Queued | Pushed::Deferred => sent_count += 1,
-                Pushed::Cut => {}
-                Pushed::Closed => tracing::debug!("Connection {} is closing: broadcast not sent", connection_id),
+    /// Queues the same frame for every connection; returns how many accepted it.
+    pub fn broadcast_frame(&self, frame: Outbound) -> usize {
+        let mut delivered = 0;
+        for handle in self.handles.iter() {
+            if handle.push(frame.clone()).is_accepted() {
+                delivered += 1;
             }
         }
+        debug!("📡 Broadcasted message to {} connections", delivered);
+        delivered
+    }
 
-        tracing::debug!("📡 Broadcasted message to {} connections", sent_count);
-        sent_count
+    /// The listener profile of a connection.
+    pub fn connection_profile(&self, connection_id: ConnectionId) -> Option<ListenerProfile> {
+        self.handles.get(&connection_id).map(|handle| handle.profile)
+    }
+
+    /// Whether a connection's frames are waiting in its backlog.
+    pub fn is_behind(&self, connection_id: ConnectionId) -> bool {
+        self.handles
+            .get(&connection_id)
+            .map(|handle| handle.outbox.is_behind())
+            .unwrap_or(false)
+    }
+
+    /// Attaches what the transport knows about a connection (RTT, datagram size).
+    pub fn set_transport_info(&self, connection_id: ConnectionId, info: Arc<dyn TransportInfo>) {
+        if let Some(mut handle) = self.handles.get_mut(&connection_id) {
+            handle.transport = Some(info);
+        }
+    }
+
+    /// What the transport knows about a connection.
+    pub fn transport_info(&self, connection_id: ConnectionId) -> Option<Arc<dyn TransportInfo>> {
+        self.handles.get(&connection_id).and_then(|handle| handle.transport.clone())
+    }
+
+    /// What became of unreliable frames.
+    pub fn delivery_stats(&self) -> &DeliveryStats {
+        &self.delivery_stats
+    }
+
+    /// Number of open connections.
+    pub fn connection_count(&self) -> usize {
+        self.handles.len()
     }
 
     /// Finds the connection ID associated with a player.
-    /// 
-    /// Searches through active connections to find the one associated
-    /// with the specified player ID.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `player_id` - The player to search for
-    /// 
-    /// # Returns
-    /// 
-    /// The `ConnectionId` if the player is found and connected,
-    /// or `None` if the player is not currently connected.
     pub async fn get_connection_id_by_player(&self, player_id: PlayerId) -> Option<ConnectionId> {
-        self.player_connections.get(&player_id).map(|conn| *conn)
+        self.connection_of(player_id)
+    }
+
+    /// Finds the connection ID associated with a player, without waiting.
+    pub fn connection_of(&self, player_id: PlayerId) -> Option<ConnectionId> {
+        self.players.get(&player_id).map(|conn| *conn)
     }
 
     /// Sets the authentication status for a connection.
-    /// 
-    /// Updates the authentication status of the specified connection.
-    /// This is typically called when authentication state changes.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `connection_id` - The connection to update
-    /// * `status` - The new authentication status
     pub async fn set_auth_status(&self, connection_id: ConnectionId, status: AuthenticationStatus) {
         let mut connections = self.connections.write().await;
         if let Some(connection) = connections.get_mut(&connection_id) {
@@ -308,48 +347,24 @@ impl ConnectionManager {
     }
 
     /// Gets the authentication status for a connection.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `connection_id` - The connection to query
-    /// 
-    /// # Returns
-    /// 
-    /// The current authentication status, or `None` if the connection doesn't exist.
     pub async fn get_auth_status(&self, connection_id: ConnectionId) -> Option<AuthenticationStatus> {
         let connections = self.connections.read().await;
         connections.get(&connection_id).map(|c| c.auth_status())
     }
 
     /// Gets the authentication status for a player.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `player_id` - The player to query
-    /// 
-    /// # Returns
-    /// 
-    /// The current authentication status, or `None` if the player is not connected.
     pub async fn get_auth_status_by_player(&self, player_id: PlayerId) -> Option<AuthenticationStatus> {
-        let connection_id = self.get_connection_id_by_player(player_id).await?;
-        let connections = self.connections.read().await;
-        connections.get(&connection_id).map(|c| c.auth_status())
+        let connection_id = self.connection_of(player_id)?;
+        self.get_auth_status(connection_id).await
     }
 
     /// Sets the authentication status for a player.
-    /// 
-    /// Updates the authentication status of the connection associated with the specified player.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `player_id` - The player to update
-    /// * `status` - The new authentication status
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// `true` if the player was found and updated, `false` otherwise.
     pub async fn set_auth_status_by_player(&self, player_id: PlayerId, status: AuthenticationStatus) -> bool {
-        let Some(connection_id) = self.get_connection_id_by_player(player_id).await else {
+        let Some(connection_id) = self.connection_of(player_id) else {
             return false;
         };
         let mut connections = self.connections.write().await;
@@ -363,19 +378,91 @@ impl ConnectionManager {
     }
 
     /// Gets detailed connection information for a player.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `player_id` - The player to query
-    /// 
-    /// # Returns
-    /// 
-    /// Connection information if the player is connected, `None` otherwise.
-    pub async fn get_connection_info_by_player(&self, player_id: PlayerId) -> Option<(ConnectionId, SocketAddr, std::time::SystemTime, AuthenticationStatus)> {
-        let connection_id = self.get_connection_id_by_player(player_id).await?;
+    pub async fn get_connection_info_by_player(
+        &self,
+        player_id: PlayerId,
+    ) -> Option<(ConnectionId, SocketAddr, std::time::SystemTime, AuthenticationStatus)> {
+        let connection_id = self.connection_of(player_id)?;
         let connections = self.connections.read().await;
-        connections
-            .get(&connection_id)
-            .map(|connection| (connection_id, connection.remote_addr, connection.connected_at, connection.auth_status()))
+        let connection = connections.get(&connection_id)?;
+        Some((
+            connection_id,
+            connection.remote_addr,
+            connection.connected_at,
+            connection.auth_status(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::connection::outbox::{Next, Queued};
+
+    fn addr() -> SocketAddr {
+        "127.0.0.1:9000".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn players_are_indexed_and_reassigned() {
+        let manager = ConnectionManager::new();
+        let (conn, _rx) = manager.open_connection(addr(), ListenerProfile::default()).await;
+        let first = PlayerId::new();
+        let second = PlayerId::new();
+
+        manager.set_player_id(conn, first).await;
+        assert_eq!(manager.get_connection_id_by_player(first).await, Some(conn));
+
+        // A connection carries one player: the old one is no longer reachable.
+        manager.set_player_id(conn, second).await;
+        assert_eq!(manager.get_connection_id_by_player(first).await, None);
+        assert_eq!(manager.get_connection_id_by_player(second).await, Some(conn));
+
+        manager.remove_connection(conn).await;
+        assert_eq!(manager.get_connection_id_by_player(second).await, None);
+        assert_eq!(manager.connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn frames_reach_the_connection_writer() {
+        let manager = ConnectionManager::new();
+        let (conn, mut rx) = manager.open_connection(addr(), ListenerProfile::default()).await;
+        manager.send_to_connection(conn, b"hello".to_vec()).await;
+        let Next::Frame(queued) = rx.next().await else { panic!("expected a frame") };
+        assert_eq!((queued.frame, queued.wrapped), (Outbound::reliable(b"hello".to_vec()), false));
+        assert_eq!(manager.send_frame(999, Outbound::reliable(Vec::new())), Pushed::Closed);
+    }
+
+    #[tokio::test]
+    async fn broadcast_shares_one_frame() {
+        let manager = ConnectionManager::new();
+        let (_a, mut rx_a) = manager.open_connection(addr(), ListenerProfile::default()).await;
+        let (_b, mut rx_b) = manager.open_connection(addr(), ListenerProfile::default()).await;
+        assert_eq!(manager.broadcast_to_all(b"all".to_vec()).await, 2);
+        let (Next::Frame(Queued { frame: a, .. }), Next::Frame(Queued { frame: b, .. })) =
+            (rx_a.next().await, rx_b.next().await)
+        else {
+            panic!("both connections should get the frame");
+        };
+        // Same allocation, not a copy.
+        assert_eq!(a.bytes.as_ptr(), b.bytes.as_ptr());
+    }
+
+    #[tokio::test]
+    async fn kick_asks_the_writer_to_close() {
+        let manager = ConnectionManager::new();
+        let (conn, mut rx) = manager.open_connection(addr(), ListenerProfile::default()).await;
+        let player = PlayerId::new();
+        manager.set_player_id(conn, player).await;
+
+        manager.kick_player(player, Some("cheating".into())).await.unwrap();
+        assert_eq!(
+            rx.next().await,
+            Next::Control(Control::Close(CloseCode::Kicked, "cheating".into()))
+        );
+        // The connection stays registered until its handler has cleaned up, so the
+        // handler can still emit player_disconnected for it.
+        assert_eq!(manager.get_player_id(conn).await, Some(player));
+        assert!(manager.kick_player(PlayerId::new(), None).await.is_err());
     }
 }

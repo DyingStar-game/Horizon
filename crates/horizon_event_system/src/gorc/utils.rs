@@ -2,6 +2,8 @@
 //!
 //! This module provides high-level utilities for creating complete GORC systems,
 //! validation tools, and performance monitoring capabilities.
+// The deprecated GORC network path is still implemented here until it is removed.
+#![allow(deprecated)]
 
 use super::{
     defaults, CompleteGorcSystem, GorcError, GorcInstanceManager, GorcPerformanceReport,
@@ -39,6 +41,7 @@ use std::sync::Arc;
 /// # Ok(())
 /// # }
 /// ```
+#[deprecated(since = "0.27.0", note = "never reaches clients: it sends through ServerContext::send_to_player, which the plugin system does not implement (BasicServerContext only logs a warning). Client replication goes through EventSystem::emit_gorc_instance* and the server listeners, with their formats, compression and delivery classes. Create the event system with EventSystem::with_gorc(GorcInstanceManager) instead. This will be removed.")]
 pub fn create_complete_gorc_system(
     server_context: Arc<dyn ServerContext>
 ) -> Result<CompleteGorcSystem, GorcError> {

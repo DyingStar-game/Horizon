@@ -785,7 +785,7 @@ mod tests {
 
         // Create plugin manager
         let event_system = Arc::new(EventSystem::new());
-        let manager = PluginManager::new(event_system, PluginSafetyConfig::default());
+        let manager = PluginManager::new(event_system, PluginSafetyConfig::default(), LogLevel::Info);
 
         // Test plugin discovery
         let discovered = manager.discover_plugin_files(temp_path).unwrap();
@@ -826,7 +826,7 @@ mod tests {
         let event_system = Arc::new(EventSystem::new());
         
         // Test exact match - should pass
-        let manager_strict = PluginManager::new(event_system.clone(), PluginSafetyConfig::default());
+        let manager_strict = PluginManager::new(event_system.clone(), PluginSafetyConfig::default(), LogLevel::Info);
         assert!(manager_strict.validate_plugin_compatibility("0.10.0:1.75.0", "0.10.0:1.75.0").is_ok());
         
         // Test crate version mismatch - should fail with strict config
@@ -846,7 +846,7 @@ mod tests {
             allow_unsafe_plugins: true,
             allow_abi_mismatch: true,
             strict_versioning: false,
-        });
+        }, LogLevel::Info);
         
         // Should pass with overrides
         assert!(manager_unsafe.validate_plugin_compatibility("0.9.0:1.74.0", "0.10.0:1.75.0").is_ok());
@@ -874,7 +874,7 @@ mod tests {
             allow_unsafe_plugins: false,
             allow_abi_mismatch: false,
             strict_versioning: false, // Relaxed versioning
-        });
+        }, LogLevel::Info);
         
         // Same major.minor, different patch - should pass with relaxed versioning
         assert!(manager_relaxed.validate_plugin_compatibility("0.11.2:1.75.0", "0.11.0:1.75.0").is_ok());
@@ -893,7 +893,7 @@ mod tests {
             allow_unsafe_plugins: false,
             allow_abi_mismatch: false,
             strict_versioning: true, // Strict versioning
-        });
+        }, LogLevel::Info);
         
         // Same major.minor, different patch - should fail with strict versioning
         let result = manager_strict.validate_plugin_compatibility("0.11.2:1.75.0", "0.11.0:1.75.0");
@@ -906,7 +906,7 @@ mod tests {
     #[test]
     fn test_major_minor_version_parsing() {
         let event_system = Arc::new(EventSystem::new());
-        let manager = PluginManager::new(event_system, PluginSafetyConfig::default());
+        let manager = PluginManager::new(event_system, PluginSafetyConfig::default(), LogLevel::Info);
         
         // Test valid version parsing
         assert!(manager.versions_major_minor_compatible("1.2.3", "1.2.0"));

@@ -6,5 +6,5 @@
 pub mod router;
 pub mod types;
 
-pub use router::route_client_message;
+pub use router::{route_client_frame, Routed, Session};
 pub use types::ClientMessage;

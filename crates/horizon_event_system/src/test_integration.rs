@@ -5,7 +5,7 @@ use tracing::debug;
 
 // Mock server context for testing
 #[cfg(test)]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct MockServerContext {
     log_level: LogLevel,
 }
@@ -50,6 +50,10 @@ impl ServerContext for MockServerContext {
         // Create a new luminal runtime for testing
         let rt = luminal::Runtime::new().expect("Failed to create luminal runtime for tests");
         rt.handle().clone()
+    }
+
+    fn tokio_handle(&self) -> tokio::runtime::Handle {
+        tokio::runtime::Handle::current()
     }
 
     fn gorc_instance_manager(&self) -> Option<Arc<crate::gorc::GorcInstanceManager>> {
@@ -107,6 +111,8 @@ fn create_test_event_system() -> Arc<EventSystem> {
     Arc::new(events)
 }
 
+// Covers the deprecated complete-system API until it is removed.
+#[allow(deprecated)]
 #[tokio::test]
 async fn test_complete_system_integration() {
     let server_context = Arc::new(MockServerContext::new());

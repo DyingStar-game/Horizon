@@ -305,6 +305,9 @@ mod tests {
             tick_interval_ms: 16, // 60 FPS
             security: Default::default(),
             plugin_safety: Default::default(),
+            websocket: Default::default(),
+            compression: Default::default(),
+            webtransport: Default::default(),
         };
 
         assert_eq!(config.bind_address.to_string(), "0.0.0.0:3000");
@@ -381,6 +384,9 @@ mod tests {
             use_reuse_port: false,
             security: Default::default(),
             plugin_safety: Default::default(),
+            websocket: Default::default(),
+            compression: Default::default(),
+            webtransport: Default::default(),
         };
 
         let server = create_server_with_config(config);

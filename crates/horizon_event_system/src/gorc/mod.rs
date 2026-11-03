@@ -82,6 +82,7 @@ pub use zones::{
     AdvancedZoneManager, ZonePerformanceMetrics
 };
 
+#[allow(deprecated)]
 pub use network::{
     NetworkReplicationEngine, ReplicationCoordinator, NetworkConfig, NetworkStats,
     ReplicationUpdate, ReplicationBatch, ReplicationStats, NetworkError,
@@ -114,6 +115,7 @@ pub use config::{
     NetworkConfig as GorcNetworkConfig, MonitoringConfig, ConfigValidationError
 };
 
+#[allow(deprecated)]
 pub use system::{
     CompleteGorcSystem, GorcPerformanceReport, GORC_VERSION, MAX_CHANNELS
 };

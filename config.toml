@@ -50,6 +50,40 @@ tick_interval_ms = 50
 # ============================================================================
 # Defines the 3D coordinate space that this server instance manages
 # For distributed servers, each instance should handle a different region
+# Client listeners (all optional; without these tables the server speaks JSON over
+# plain WebSocket on bind_address, as it always has).
+#
+# [server.websocket]
+# protocol = "json"            # "json" | "bitcode"
+# compression = "none"         # "none" | "zstd" | "lz4"
+# cert_path = "tls/cert.pem"   # set both to serve wss://
+# key_path = "tls/key.pem"
+#
+# [server.webtransport]        # HTTP/3 over QUIC, one UDP port
+# enabled = false
+# bind_address = "0.0.0.0:4433"
+# protocol = "bitcode"
+# compression = "none"
+# cert_path = "tls/cert.pem"   # required: WebTransport always runs over TLS
+# key_path = "tls/key.pem"
+# idle_timeout_ms = 15000
+# keepalive_ms = 5000
+# max_datagram_size = 1200
+# datagram_send_buffer_bytes = 16384  # quinn's default is 1 MiB
+# unreliable_max_age_ms = 100         # older unreliable frames are dropped
+# cert_reload_interval_ms = 10000
+#
+# [server.compression]         # listeners with compression = "zstd" or "lz4"
+# level = 1                    # zstd only: 1-3, negative = faster
+# min_size = 128               # smaller frames are batched per recipient
+# batch_delay_ms = 0
+# dictionary_path = "game.dict"
+#
+# [server.security]
+# max_message_size = 65536     # bytes, checked before and after decompression
+# max_decode_errors = 5        # undecodable frames before disconnecting
+# banned_ips = []
+
 [server.region]
 # World boundaries (in game units)
 # PERFORMANCE IMPACT: Larger regions require more spatial indexing resources

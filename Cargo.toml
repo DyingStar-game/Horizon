@@ -8,8 +8,9 @@ members = [
 [workspace.dependencies]
 # === Async Runtime & Networking ===
 async-trait = "0.1"
+bytes = "1"
 futures = "0.3"
-horizon_sockets = { git = "https://github.com/Far-Beyond-Dev/Horizon-Sockets", rev = "aa0badb262e1344a8aceaaf5caf55012dc7fa89a" }
+horizon_sockets = { git = "https://github.com/Far-Beyond-Dev/Horizon-Sockets", rev = "50606e28a7a18f0b3dce783267266fb8c00a1232" }
 luminal_rt = "0.4.1"
 tokio = { version = "1.48", features = ["full"] }
 tokio-tungstenite = "0.27.0"
@@ -17,6 +18,11 @@ tokio-tungstenite = "0.27.0"
 metrics = "0.24"
 # metrics-exporter-prometheus = { version = "0.18", features = ["uds-listener"] }
 tokio-blocked = "*"
+# WebTransport (HTTP/3 over QUIC). The "quinn" feature exposes quinn's transport
+# settings (datagram send buffer).
+wtransport = { version = "0.6.1", features = ["quinn"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
 
 # === CLI & Configuration ===
 clap = { version = "4.0", features = ["derive"] }
@@ -32,8 +38,14 @@ rayon = "1.7.0"
 # === Data Processing & Encoding ===
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0.143"
+serde_json = { version = "1.0.143", features = ["raw_value"] }
 base64 = "0.22"
+# Exact pin: bitcode only guarantees its format within a version, so an upgrade is a
+# protocol version bump (horizon_protocol::PROTOCOL_VERSION). Plugins deriving bitcode
+# must use this same version.
+bitcode = { version = "=0.6.9", features = ["serde"] }
+lz4_flex = "0.11"
+zstd = "0.13"
 flate2 = "1.0"
 
 # === Error Handling ===
@@ -66,6 +78,7 @@ Horizon-Network-Common = "0.2.0"
 # === Workspace Dependencies ===
 game_server = { path = "crates/game_server" }
 horizon = { path = "crates/horizon" }
+horizon_protocol = { path = "crates/horizon_protocol" }
 horizon_event_system = { path = "crates/horizon_event_system" }
 plugin_system = { path = "crates/plugin_system" }
 horizon_bugs = { path = "crates/horizon_bugs" }

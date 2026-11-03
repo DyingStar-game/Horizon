@@ -79,9 +79,20 @@ impl EventSystem {
                         });
                         
                         if let Ok(message_bytes) = serde_json::to_vec(&gorc_message) {
-                            // Send to each subscriber individually
+                            let message_bytes = bytes::Bytes::from(message_bytes);
+                            // Send to each JSON subscriber individually. Bitcode
+                            // subscribers already got the event in its own frame.
                             for subscriber_id in &subscribers {
-                                if let Err(e) = client_sender.send_to_client(*subscriber_id, message_bytes.clone()).await {
+                                let format = client_sender
+                                    .connection_profile(*subscriber_id)
+                                    .await
+                                    .map(|profile| profile.format)
+                                    .unwrap_or_default();
+                                if format != horizon_protocol::Format::Json {
+                                    continue;
+                                }
+                                let frame = crate::Outbound::reliable(message_bytes.clone());
+                                if let Err(e) = client_sender.send_frame(*subscriber_id, frame).await {
                                     warn!("Failed to send GORC event to subscriber {}: {}", subscriber_id, e);
                                 }
                             }

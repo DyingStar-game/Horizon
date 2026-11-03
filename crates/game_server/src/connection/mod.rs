@@ -4,10 +4,13 @@
 //! connection tracking, player ID assignment, and message routing.
 
 pub mod client;
+pub mod compress;
 pub mod manager;
 pub mod outbox;
 pub mod response;
 
+pub use horizon_event_system::protocol::CloseCode;
+pub use compress::ListenerCompression;
 pub use manager::ConnectionManager;
 pub use response::GameServerResponseSender;
 

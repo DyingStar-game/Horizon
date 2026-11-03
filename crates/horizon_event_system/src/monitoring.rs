@@ -1,3 +1,5 @@
+// The deprecated GORC network path is still implemented here until it is removed.
+#![allow(deprecated)]
 /// Performance monitoring utilities
 use crate::*;
 use std::time::Instant;

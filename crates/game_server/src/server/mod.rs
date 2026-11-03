@@ -6,4 +6,4 @@
 pub mod core;
 pub mod handlers;
 
-pub use core::GameServer;
+pub use core::{DeliveryCounters, GameServer};

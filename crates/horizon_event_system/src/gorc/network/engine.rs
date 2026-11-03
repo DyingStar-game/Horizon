@@ -1,3 +1,5 @@
+// The deprecated GORC network path is still implemented here until it is removed.
+#![allow(deprecated)]
 /// Network replication engine implementation
 use super::types::{NetworkConfig, NetworkStats, NetworkError, ReplicationBatch, ReplicationUpdate};
 use super::queue::PlayerNetworkState;
@@ -12,6 +14,7 @@ use flate2::{Compression, write::DeflateEncoder, read::DeflateDecoder};
 use std::io::prelude::*;
 
 /// Core network replication engine that manages update distribution
+#[deprecated(since = "0.27.0", note = "never reaches clients: it sends through ServerContext::send_to_player, which the plugin system does not implement (BasicServerContext only logs a warning). Client replication goes through EventSystem::emit_gorc_instance* and the server listeners, with their formats, compression and delivery classes. Create the event system with EventSystem::with_gorc(GorcInstanceManager) instead. This will be removed.")]
 #[derive(Debug, Clone)]
 pub struct NetworkReplicationEngine {
     /// Per-player network states

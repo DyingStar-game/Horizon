@@ -1,3 +1,5 @@
+// The deprecated GORC network path is still implemented here until it is removed.
+#![allow(deprecated)]
 /// High-level API functions for creating and managing Horizon systems
 use crate::*;
 
@@ -81,6 +83,7 @@ use crate::*;
 ///     Ok(())
 /// }
 /// ```
+#[deprecated(since = "0.27.0", note = "never reaches clients: it sends through ServerContext::send_to_player, which the plugin system does not implement (BasicServerContext only logs a warning). Client replication goes through EventSystem::emit_gorc_instance* and the server listeners, with their formats, compression and delivery classes. Create the event system with EventSystem::with_gorc(GorcInstanceManager) instead. This will be removed.")]
 pub fn create_complete_horizon_system(
     server_context: Arc<dyn ServerContext>
 ) -> Result<(Arc<EventSystem>, CompleteGorcSystem), gorc::GorcError> {

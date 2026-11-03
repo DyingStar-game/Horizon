@@ -2,6 +2,8 @@
 //!
 //! This module handles the actual network transmission of replication data,
 //! including batching, compression, prioritization, and delivery guarantees.
+// The deprecated GORC network path is still implemented here until it is removed.
+#![allow(deprecated)]
 
 mod coordinator;
 mod engine;

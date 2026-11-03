@@ -8,12 +8,13 @@ use crate::{
     config::ServerConfig,
     connection::{ConnectionManager, GameServerResponseSender},
     error::ServerError,
-    server::handlers::handle_connection,
+    server::handlers::{handle_connection, ListenerSettings},
+    connection::ListenerCompression,
 };
 use plugin_system::PluginManager;
 use futures::stream::{FuturesUnordered, StreamExt as FuturesStreamExt};
 use horizon_event_system::{
-    current_timestamp, EventSystem, GorcManager, MulticastManager,
+    current_timestamp, EventSystem, GorcManager, ListenerProfile, MulticastManager, Transport,
     PlayerConnectedEvent, PlayerDisconnectedEvent, RegionId, RegionStartedEvent, SpatialPartition,
     SubscriptionManager, AuthenticationStatusSetEvent, AuthenticationStatusGetEvent, 
     AuthenticationStatusGetResponseEvent, AuthenticationStatusChangedEvent, ShutdownState,
@@ -27,6 +28,19 @@ use bug::bug_with_handle;
 
 #[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd", target_os = "dragonfly", target_os = "macos"))]
 use std::os::fd::AsRawFd;
+
+/// Counters of unreliable frames, see [`GameServer::delivery_counters`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeliveryCounters {
+    /// Sent as datagrams.
+    pub datagrams_sent: u64,
+    /// Dropped because the connection was behind.
+    pub dropped_behind: u64,
+    /// Dropped because they waited longer than `unreliable_max_age_ms`.
+    pub dropped_too_old: u64,
+    /// Sent reliably: WebSocket, or too large for a datagram.
+    pub sent_reliably: u64,
+}
 
 /// The core game server structure.
 /// 
@@ -220,6 +234,72 @@ impl GameServer {
         self.start_internal(None).await
     }
 
+    /// Starts the WebTransport listener next to the WebSocket one.
+    fn start_webtransport(&self, websocket: &ListenerSettings) -> Result<(), ServerError> {
+        use crate::transport::{tls::TlsFiles, webtransport};
+        use std::time::Duration;
+        let config = &self.config.webtransport;
+        let (Some(cert_path), Some(key_path)) = (&config.cert_path, &config.key_path) else {
+            return Err(ServerError::Internal(
+                "[server.webtransport] needs cert_path and key_path: WebTransport always runs over TLS".into(),
+            ));
+        };
+        let settings = webtransport::WebTransportSettings {
+            bind_address: config.bind_address,
+            tls: TlsFiles { cert_path: cert_path.clone(), key_path: key_path.clone() },
+            reload_interval: Duration::from_millis(config.cert_reload_interval_ms),
+            idle_timeout: Duration::from_millis(config.idle_timeout_ms),
+            keepalive: Duration::from_millis(config.keepalive_ms),
+            max_datagram_size: config.max_datagram_size,
+            datagram_send_buffer_bytes: config.datagram_send_buffer_bytes,
+            unreliable_max_age: Duration::from_millis(config.unreliable_max_age_ms),
+            stream_timeout: Duration::from_secs(10),
+        };
+        let listener = ListenerSettings {
+            profile: ListenerProfile::new(Transport::WebTransport)
+                .with_format(config.protocol)
+                .with_compression(config.compression),
+            compression: Arc::new(ListenerCompression::new(self.listener_compression(config.compression)?)),
+            tls: None,
+            ..websocket.clone()
+        };
+        let connection_manager = self.connection_manager.clone();
+        let events = self.horizon_event_system.clone();
+        let shutdown = self.shutdown_sender.subscribe();
+        tokio::spawn(async move {
+            if let Err(e) = webtransport::run(settings, listener, connection_manager, events, shutdown).await {
+                error!("WebTransport listener stopped: {}", e);
+            }
+        });
+        Ok(())
+    }
+
+    /// A listener's compression with `codec`, with its dictionary loaded.
+    fn listener_compression(
+        &self,
+        codec: horizon_event_system::protocol::Codec,
+    ) -> Result<horizon_event_system::protocol::Compression, ServerError> {
+        use horizon_event_system::protocol::{Compression, Dictionary};
+        let settings = &self.config.compression;
+        let dictionary = match &settings.dictionary_path {
+            Some(path) if codec != horizon_event_system::protocol::Codec::None => {
+                let bytes = std::fs::read(path).map_err(|e| {
+                    ServerError::Internal(format!("Cannot read compression dictionary {}: {e}", path.display()))
+                })?;
+                let dictionary = Dictionary::new(bytes);
+                info!("📚 Compression dictionary {} ({})", dictionary.id(), path.display());
+                Some(dictionary)
+            }
+            _ => None,
+        };
+        Ok(Compression {
+            codec,
+            level: settings.level,
+            min_size: settings.min_size,
+            dictionary,
+        })
+    }
+
     /// Internal method for starting the server with optional shutdown state.
     async fn start_internal(&self, shutdown_state: Option<ShutdownState>) -> Result<(), ServerError> {
         info!("🚀 Starting game server on {}", self.config.bind_address);
@@ -350,9 +430,39 @@ impl GameServer {
         let mut shutdown_receiver = self.shutdown_sender.subscribe();
 
         // Create futures for all accept loops with shutdown monitoring
+        let compression = self.listener_compression(self.config.websocket.compression)?;
+        let tls = match (&self.config.websocket.cert_path, &self.config.websocket.key_path) {
+            (Some(cert_path), Some(key_path)) => Some(crate::transport::tls::ReloadingAcceptor::new(
+                crate::transport::tls::TlsFiles { cert_path: cert_path.clone(), key_path: key_path.clone() },
+                std::time::Duration::from_millis(self.config.webtransport.cert_reload_interval_ms),
+            )?),
+            _ => None,
+        };
+        let listener_settings = ListenerSettings {
+            profile: ListenerProfile::new(Transport::WebSocket)
+                .with_format(self.config.websocket.protocol)
+                .with_compression(self.config.websocket.compression),
+            max_frame_size: self.config.security.max_message_size,
+            max_decode_errors: self.config.security.max_decode_errors,
+            compression: Arc::new(ListenerCompression::new(compression)),
+            batch_delay: std::time::Duration::from_millis(self.config.compression.batch_delay_ms),
+            max_connections: self.config.max_connections,
+            banned_ips: Arc::new(self.config.security.banned_ips.clone()),
+            tls: tls.clone(),
+        };
+        info!(
+            "🔌 WebSocket listener speaks {}, compression {}{}",
+            self.config.websocket.protocol,
+            self.config.websocket.compression,
+            if tls.is_some() { ", TLS" } else { "" }
+        );
+        if self.config.webtransport.enabled {
+            self.start_webtransport(&listener_settings)?;
+        }
         let mut accept_futures = listeners
             .into_iter()
             .map(|listener| {
+                let listener_settings = listener_settings.clone();
                 let connection_manager = self.connection_manager.clone();
                 let horizon_event_system = self.horizon_event_system.clone();
                 let shutdown_state_clone = shutdown_state.clone();
@@ -371,6 +481,7 @@ impl GameServer {
                             Ok((stream, addr)) => {
                                 let connection_manager = connection_manager.clone();
                                 let horizon_event_system = horizon_event_system.clone();
+                                let listener_settings = listener_settings.clone();
 
                                 // Spawn individual connection handler
                                 tokio::spawn(async move {
@@ -379,6 +490,7 @@ impl GameServer {
                                         addr,
                                         connection_manager,
                                         horizon_event_system,
+                                        listener_settings,
                                     ).await {
                                         error!("Connection error: {:?}", e);
                                     }
@@ -605,7 +717,7 @@ impl GameServer {
         // Register a simple ping handler for testing validity of the client connection
         let host_rt_ping = host_rt.clone();
         self.horizon_event_system
-            .on_client("system", "ping", move |data: serde_json::Value, player_id: horizon_event_system::PlayerId, conn| {
+            .on_client("system", "ping", move |data: serde_json::Value, _player_id: horizon_event_system::PlayerId, conn| {
                 info!("🔧 GameServer: Received 'ping' event with connection: {:?}, data: {:?}", conn, data);
 
                 let response = serde_json::json!({
@@ -721,6 +833,19 @@ impl GameServer {
         info!("🛑 Shutting down server...");
         let _ = self.shutdown_sender.send(());
         Ok(())
+    }
+
+    /// What became of unreliable frames since the server started: sent as datagrams,
+    /// dropped (connection behind, frame too old), or sent reliably instead.
+    pub fn delivery_counters(&self) -> DeliveryCounters {
+        use crate::connection::manager::DeliveryStats;
+        let stats = self.connection_manager.delivery_stats();
+        DeliveryCounters {
+            datagrams_sent: DeliveryStats::get(&stats.datagrams_sent),
+            dropped_behind: DeliveryStats::get(&stats.dropped_behind),
+            dropped_too_old: DeliveryStats::get(&stats.dropped_too_old),
+            sent_reliably: DeliveryStats::get(&stats.sent_reliably),
+        }
     }
 
     /// Gets a reference to the event system.

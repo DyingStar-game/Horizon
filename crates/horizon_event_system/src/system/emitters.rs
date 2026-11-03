@@ -5,6 +5,9 @@ use crate::{PlayerId, Vec3};
 use super::core::EventSystem;
 use super::stats::{DetailedEventSystemStats, HandlerCategoryStats};
 use futures::{self, stream::{FuturesUnordered, StreamExt}};
+use horizon_protocol::{json, Format, ServerFrame};
+use crate::system::client::{Delivery, Outbound};
+use std::sync::atomic::Ordering;
 use tracing::{debug, error, info, warn};
 use compact_str::CompactString;
 
@@ -160,6 +163,7 @@ impl EventSystem {
                         data: Event::serialize(event)?,
                         priority: "Normal".to_string(),
                         timestamp: crate::utils::current_timestamp(),
+                        format: Format::Json,
                     };
                     
                     // Emit to instance-specific handlers only
@@ -170,7 +174,8 @@ impl EventSystem {
                 
                 // Handle Client or Both destinations - emit to subscribed clients
                 if dest == Dest::Client || dest == Dest::Both {
-                    self.emit_to_gorc_subscribers(object_id, channel, event_name, event).await?;
+                    self.deliver_gorc_event(object_id, channel, event_name, &|format| encode_serde_payload(format, event), None, None)
+                        .await?;
                 }
                 
                 Ok(())
@@ -182,74 +187,216 @@ impl EventSystem {
         }
     }
     
-    /// Emits event data directly to clients subscribed to the object's channel
-    async fn emit_to_gorc_subscribers<T>(
+    /// Emits a GORC instance event with an explicit delivery class (`None`: the
+    /// channel's default, see [`ReplicationLayer::delivery`]).
+    ///
+    /// Each subscriber gets the event in its listener's format; the payload is encoded
+    /// at most once per format in use (bitcode through serde).
+    ///
+    /// [`ReplicationLayer::delivery`]: crate::ReplicationLayer::delivery
+    pub async fn emit_gorc_instance_typed<T>(
         &self,
         object_id: GorcObjectId,
         channel: u8,
         event_name: &str,
         event: &T,
+        dest: crate::events::Dest,
+        delivery: Option<Delivery>,
     ) -> Result<(), EventError>
     where
         T: Event + serde::Serialize,
     {
-        // Get the client response sender
+        self.emit_gorc_instance_with(object_id, channel, event_name, event, dest, delivery, &|format| {
+            encode_serde_payload(format, event)
+        })
+        .await
+    }
+
+    /// Like [`emit_gorc_instance_typed`](Self::emit_gorc_instance_typed), with the
+    /// bitcode derive for bitcode subscribers: for hot types.
+    pub async fn emit_gorc_instance_packed<T>(
+        &self,
+        object_id: GorcObjectId,
+        channel: u8,
+        event_name: &str,
+        event: &T,
+        dest: crate::events::Dest,
+        delivery: Option<Delivery>,
+    ) -> Result<(), EventError>
+    where
+        T: Event + serde::Serialize + horizon_protocol::bitcode::Encode,
+    {
+        self.emit_gorc_instance_with(object_id, channel, event_name, event, dest, delivery, &|format| {
+            horizon_protocol::payload::encode_packed(format, event)
+                .map_err(|e| EventError::HandlerExecution(e.to_string()))
+        })
+        .await
+    }
+
+    /// Sends an already encoded payload to the subscribers of an object's channel that
+    /// use `format`. Subscribers on another format are skipped, with a warning and a
+    /// count ([`EventSystem::skipped_format_mismatches`]). Server-side handlers are not
+    /// called: they need a typed event.
+    pub async fn emit_gorc_instance_bytes(
+        &self,
+        object_id: GorcObjectId,
+        channel: u8,
+        event_name: &str,
+        payload: bytes::Bytes,
+        format: Format,
+        delivery: Option<Delivery>,
+    ) -> Result<usize, EventError> {
+        self.deliver_gorc_event(object_id, channel, event_name, &|_| Ok(payload.to_vec()), delivery, Some(format))
+            .await
+    }
+
+    /// Subscribers skipped so far by [`emit_gorc_instance_bytes`] because they use
+    /// another format.
+    ///
+    /// [`emit_gorc_instance_bytes`]: EventSystem::emit_gorc_instance_bytes
+    pub fn skipped_format_mismatches(&self) -> u64 {
+        self.skipped_format_mismatch.load(Ordering::Relaxed)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn emit_gorc_instance_with<T>(
+        &self,
+        object_id: GorcObjectId,
+        channel: u8,
+        event_name: &str,
+        event: &T,
+        dest: crate::events::Dest,
+        delivery: Option<Delivery>,
+        encode: &(dyn Fn(Format) -> Result<Vec<u8>, EventError> + Sync),
+    ) -> Result<(), EventError>
+    where
+        T: Event + serde::Serialize,
+    {
+        use crate::events::Dest;
+        if dest == Dest::None {
+            return Ok(());
+        }
+        if dest == Dest::Server || dest == Dest::Both {
+            let gorc_instances = self.gorc_instances.as_ref().ok_or_else(|| {
+                EventError::HandlerExecution("GORC instance manager not available".to_string())
+            })?;
+            let object_type = gorc_instances
+                .get_object_type(object_id)
+                .await
+                .ok_or_else(|| EventError::HandlerNotFound(format!("Object instance {} not found", object_id)))?;
+            let instance_key = CompactString::new_inline("gorc_instance:") + &object_type + ":" + &channel.to_string() + ":" + event_name;
+            // Server-side handlers deserialize a GorcEvent, as in emit_gorc_instance.
+            let gorc_event = crate::events::GorcEvent {
+                object_id: object_id.to_string(),
+                instance_uuid: object_id.to_string(),
+                object_type: object_type.clone(),
+                channel,
+                data: Event::serialize(event)?,
+                priority: "Normal".to_string(),
+                timestamp: crate::utils::current_timestamp(),
+                format: Format::Json,
+            };
+            if let Err(e) = self.emit_event(&instance_key, &gorc_event).await {
+                warn!("Failed to emit instance event: {}", e);
+            }
+        }
+        if dest == Dest::Client || dest == Dest::Both {
+            self.deliver_gorc_event(object_id, channel, event_name, encode, delivery, None).await?;
+        }
+        Ok(())
+    }
+
+    /// The listener format of each player (JSON when the sender does not know).
+    async fn formats_of(&self, players: Vec<PlayerId>) -> Vec<(PlayerId, Format)> {
+        let Some(sender) = self.client_response_sender.as_ref() else {
+            return players.into_iter().map(|p| (p, Format::Json)).collect();
+        };
+        let mut out = Vec::with_capacity(players.len());
+        for player in players {
+            let format = sender
+                .connection_profile(player)
+                .await
+                .map(|profile| profile.format)
+                .unwrap_or_default();
+            out.push((player, format));
+        }
+        out
+    }
+
+    /// Delivers an event to the subscribers of an object's channel, each in its own
+    /// format. `only` restricts delivery to the subscribers of one format. Returns how
+    /// many subscribers it was queued for.
+    async fn deliver_gorc_event(
+        &self,
+        object_id: GorcObjectId,
+        channel: u8,
+        event_name: &str,
+        encode: &(dyn Fn(Format) -> Result<Vec<u8>, EventError> + Sync),
+        delivery: Option<Delivery>,
+        only: Option<Format>,
+    ) -> Result<usize, EventError> {
         let sender = self.client_response_sender.as_ref().ok_or_else(|| {
             EventError::HandlerExecution("Client response sender not configured for GORC emission".to_string())
         })?;
-        
-        // Get the GORC instances manager to find subscribers
         let gorc_instances = self.gorc_instances.as_ref().ok_or_else(|| {
             EventError::HandlerExecution("GORC instance manager not available".to_string())
         })?;
-        
-        // Get the object instance (this creates a clone)
         let instance = gorc_instances.get_object(object_id).await.ok_or_else(|| {
             EventError::HandlerNotFound(format!("Object instance {} not found", object_id))
         })?;
-        
-        // Get the replication layer for this channel
         let layer = instance.cached_layers.iter().find(|l| l.channel == channel).ok_or_else(|| {
             EventError::HandlerExecution(format!("Channel {} not defined for object {}", channel, object_id))
         })?;
+        let delivery = delivery.unwrap_or(layer.delivery);
         
-        // CRITICAL: Get subscribers from the instance's subscription list
         // The subscribers list is managed by zone enter/exit logic and is the authoritative source
-        let subscribers: Vec<PlayerId> = instance.subscribers
-            .get(&channel)
-            .map(|subs| subs.iter().copied().collect())
-            .unwrap_or_else(Vec::new);
-        
-        // DEBUG: Also check subscriber count directly from DashMap for diagnostic purposes
-        let direct_sub_count = gorc_instances.get_subscriber_count(object_id, channel).await;
-        
-        if subscribers.len() != direct_sub_count {
-            warn!("📡 GORC EMIT MISMATCH: Object {} ({}) ch{} - cloned has {} subs, DashMap has {} subs!",
-                  object_id, instance.type_name, channel, subscribers.len(), direct_sub_count);
+        let subscribers = instance.get_subscribers(channel);
+        debug!("📡 GORC EMIT: Object {} channel {} has {} subscribers", object_id, channel, subscribers.len());
+        if subscribers.is_empty() {
+            return Ok(0);
         }
+        let seq = gorc_instances.next_sequence(object_id, channel);
+        let timestamp = crate::utils::current_timestamp();
         
-        debug!("📡 GORC EMIT: Object {} ({}) ch{} event '{}' -> {} subscribers", 
-               object_id, instance.type_name, channel, event_name, subscribers.len());
-        
-        // Create the event message for clients - just use the event_name directly
-        let client_event = serde_json::json!({
-            "event_type": event_name,
-            "object_id": object_id.to_string(),
-            "object_type": instance.type_name,
-            "channel": channel,
-            "player_id": object_id.to_string(),
-            "data": event,
-            "timestamp": crate::utils::current_timestamp()
-        });
-        
-        // Serialize the event data
-        let data = serde_json::to_vec(&client_event)
-            .map_err(|e| EventError::Serialization(e))?;
-        
-        // Send to all subscribers
+        // One encoding per format, made on first use and shared by every subscriber.
+        let mut frames: [Option<Option<bytes::Bytes>>; 2] = [None, None];
         let mut sent_count = 0;
-        for player_id in subscribers {
-            if let Err(e) = sender.send_to_client(player_id, data.clone()).await {
+        for (player_id, format) in self.formats_of(subscribers).await {
+            if only.is_some_and(|f| f != format) {
+                let skipped = self.skipped_format_mismatch.fetch_add(1, Ordering::Relaxed);
+                if skipped % 1000 == 0 {
+                    warn!(
+                        "GORC event {} of object {} not sent to player {}: payload is {} but the player's listener is {} ({} skipped so far)",
+                        event_name, object_id, player_id, only.unwrap_or_default(), format, skipped + 1
+                    );
+                }
+                continue;
+            }
+            let frame = frames[format.index()].get_or_insert_with(|| {
+                let encoded = match format {
+                    Format::Json => encode(Format::Json).and_then(|payload| {
+                        json_gorc_event(&instance, event_name, channel, payload, timestamp, delivery, seq)
+                    }),
+                    Format::Bitcode => encode(Format::Bitcode).and_then(|payload| {
+                        let handle = gorc_instances.object_handle(object_id).ok_or_else(|| {
+                            EventError::HandlerExecution(format!("Object {} has no wire handle", object_id))
+                        })?;
+                        Ok(horizon_protocol::encode_server(&ServerFrame::GorcEvent {
+                            handle,
+                            channel,
+                            seq,
+                            event: self.event_table.key(event_name),
+                            payload,
+                        }))
+                    }),
+                };
+                encoded
+                    .map_err(|e| warn!("Cannot encode GORC event {} for {} clients: {}", event_name, format, e))
+                    .ok()
+            });
+            let Some(bytes) = frame else { continue };
+            let outbound = Outbound { bytes: bytes.clone(), delivery };
+            if let Err(e) = sender.send_frame(player_id, outbound).await {
                 // debug!, not warn!: a subscriber that went away produces one line per
                 // replicated event per tick. On preprod three stale subscribers alone
                 // pushed this to ~700 lines/s, which cut the pod's log retention to 97
@@ -262,8 +409,7 @@ impl EventSystem {
         
         debug!("📡 GORC: Sent {} event to {} clients on channel {} for object {}", 
                event_name, sent_count, channel, object_id);
-        
-        Ok(())
+        Ok(sent_count)
     }
     
     /// Update player position and handle zone membership changes (event-driven GORC)
@@ -380,56 +526,86 @@ impl EventSystem {
     
     /// Send zone entry message with current object state for a specific layer to a player
     async fn send_zone_entry_message(&self, player_id: PlayerId, object_id: GorcObjectId, channel: u8) -> Result<(), EventError> {
-        // Get the client response sender
         let sender = self.client_response_sender.as_ref().ok_or_else(|| {
             EventError::HandlerExecution("Client response sender not configured".to_string())
         })?;
-        
-        // Get the GORC instances manager
         let gorc_instances = self.gorc_instances.as_ref().ok_or_else(|| {
             EventError::HandlerExecution("GORC instance manager not available".to_string())
         })?;
-        
-        // Get the object instance
-        let instance = gorc_instances.get_object(object_id).await.ok_or_else(|| {
+        let object_type = gorc_instances.get_object_type(object_id).await.ok_or_else(|| {
             EventError::HandlerNotFound(format!("Object instance {} not found", object_id))
         })?;
+        let format = self.formats_of(vec![player_id]).await[0].1;
         
-        // Get current state for this layer
-        if let Some(layer_data) = gorc_instances.get_object_state_for_layer(object_id, channel).await {
-            // Create zone entry message with proper format
+        let Some(layer_data) = gorc_instances.get_object_state_for_layer_as(object_id, channel, format).await else {
+            warn!("❌ GORC: No layer data available for object {} channel {}", object_id, channel);
+            return Ok(());
+        };
+        // ds_audio reacts to player zone entries through a core event, which stays JSON
+        // whatever the client's format.
+        let core_zone_data = if object_type == "player" {
+            let json_state = match format {
+                Format::Json => Some(layer_data.clone()),
+                Format::Bitcode => gorc_instances.get_object_state_for_layer(object_id, channel).await,
+            };
+            Some(
+                json_state
+                    .and_then(|data| serde_json::from_slice::<serde_json::Value>(&data).ok())
+                    .unwrap_or(serde_json::Value::Null),
+            )
+        } else {
+            None
+        };
+        let data = match format {
+            Format::Json => {
+                let zone_entry_event = json::ZoneEnter {
+                    kind: json::ZoneEnter::TYPE,
+                    object_id: object_id.to_string(),
+                    object_type: &object_type,
+                    channel,
+                    player_id: player_id.to_string(),
+                    zone_data: serde_json::from_slice::<serde_json::Value>(&layer_data)
+                        .unwrap_or(serde_json::Value::Null),
+                    timestamp: crate::utils::current_timestamp(),
+                };
+                bytes::Bytes::from(serde_json::to_vec(&zone_entry_event)?)
+            }
+            Format::Bitcode => {
+                let handle = gorc_instances.object_handle(object_id).ok_or_else(|| {
+                    EventError::HandlerExecution(format!("Object {} has no wire handle", object_id))
+                })?;
+                horizon_protocol::encode_server(&ServerFrame::ZoneEnter {
+                    handle,
+                    object_id: *object_id.0.as_bytes(),
+                    object_type: object_type.clone(),
+                    channel,
+                    zone_data: layer_data,
+                })
+            }
+        };
+        
+        if let Err(e) = sender.send_frame(player_id, Outbound::reliable(data)).await {
+            warn!("❌ Failed to send zone entry message to player {}: {}", player_id, e);
+        } else {
+            info!("🔔 GORC: Player {} entered zone {} of object {} ({})",
+                  player_id, channel, object_id, object_type);
+        }
+
+        if let Some(zone_data) = core_zone_data {
+            // Also broadcast a server-side core event so plugins can react to zone enter.
             let zone_entry_event = serde_json::json!({
                 "type": "gorc_zone_enter",
                 "object_id": object_id.to_string(),
-                "object_type": instance.type_name,
+                "object_type": object_type,
                 "channel": channel,
                 "player_id": player_id.to_string(),
-                "zone_data": serde_json::from_slice::<serde_json::Value>(&layer_data)
-                    .unwrap_or(serde_json::Value::Null),
+                "zone_data": zone_data,
                 "timestamp": crate::utils::current_timestamp()
             });
-            
-            // Serialize and send
-            let data = serde_json::to_vec(&zone_entry_event)
-                .map_err(|e| EventError::Serialization(e))?;
-            
-            if let Err(e) = sender.send_to_client(player_id, data).await {
-                warn!("❌ Failed to send zone entry message to player {}: {}", player_id, e);
-            } else {
-                info!("🔔 GORC: Player {} entered zone {} of object {} ({})", 
-                      player_id, channel, object_id, instance.type_name);
+            if let Err(e) = self.emit_core("gorc_zone_entered", &zone_entry_event).await {
+                warn!("⚠️ Failed to emit core gorc_zone_entered event: {}", e);
             }
-
-            if instance.type_name == "player" {
-                // Also broadcast a server-side core event so plugins can react to zone enter.
-                if let Err(e) = self.emit_core("gorc_zone_entered", &zone_entry_event).await {
-                    warn!("⚠️ Failed to emit core gorc_zone_entered event: {}", e);
-                }
-            }
-        } else {
-            warn!("❌ GORC: No layer data available for object {} channel {}", object_id, channel);
         }
-        
         Ok(())
     }
 
@@ -441,58 +617,46 @@ impl EventSystem {
     /// player out of its own zones. The client then dropped its own body and its
     /// camera fell to another avatar's (preprod, 2026-10-04).
     async fn send_zone_exit_message(&self, player_id: PlayerId, object_id: GorcObjectId, channel: u8) -> Result<(), EventError> {
-        // Get the client response sender
         let sender = self.client_response_sender.as_ref().ok_or_else(|| {
             EventError::HandlerExecution("Client response sender not configured".to_string())
         })?;
-        
-        // Get the GORC instances manager for object type lookup
         let gorc_instances = self.gorc_instances.as_ref().ok_or_else(|| {
             EventError::HandlerExecution("GORC instance manager not available".to_string())
         })?;
+        // Graceful fallback if the object no longer exists
+        let object_type = gorc_instances
+            .get_object_type(object_id)
+            .await
+            .unwrap_or_else(|| "Unknown".to_string());
+        let format = self.formats_of(vec![player_id]).await[0].1;
         
-        // Get object type for logging (optional - graceful fallback if object no longer exists)
-        let object_type = if let Some(instance) = gorc_instances.get_object(object_id).await {
-            instance.type_name.clone()
-        } else {
-            "Unknown".to_string()
+        let data = match format {
+            Format::Json => {
+                let zone_exit_event = json::ZoneExit {
+                    kind: json::ZoneExit::TYPE,
+                    object_id: object_id.to_string(),
+                    object_type: &object_type,
+                    channel,
+                    player_id: player_id.to_string(),
+                    timestamp: crate::utils::current_timestamp(),
+                };
+                bytes::Bytes::from(serde_json::to_vec(&zone_exit_event)?)
+            }
+            Format::Bitcode => match gorc_instances.object_handle(object_id) {
+                Some(handle) => horizon_protocol::encode_server(&ServerFrame::ZoneExit { handle, channel }),
+                None => {
+                    debug!("No wire handle for removed object {}: zone exit not sent", object_id);
+                    return Ok(());
+                }
+            },
         };
         
-        // Create zone exit message
-        let zone_exit_event = serde_json::json!({
-            "type": "gorc_zone_exit",
-            "object_id": object_id.to_string(),
-            "object_type": object_type,
-            "channel": channel,
-            "player_id": player_id.to_string(),
-            "timestamp": crate::utils::current_timestamp()
-        });
-        
-        // Serialize and send
-        let data = serde_json::to_vec(&zone_exit_event)
-            .map_err(|e| EventError::Serialization(e))?;
-        
-        if let Err(e) = sender.send_to_client(player_id, data).await {
+        if let Err(e) = sender.send_frame(player_id, Outbound::reliable(data)).await {
             warn!("❌ Failed to send zone exit message to player {}: {}", player_id, e);
         } else {
             info!("🚪 GORC: Player {} exited zone {} of object {} ({})", 
                   player_id, channel, object_id, object_type);
         }
-
-        // if object_type == "player" {
-        //     // Also broadcast a server-side core event so plugins can react to zone exit.
-        //     let zone_exit_core = serde_json::json!({
-        //         "player_id": player_id.to_string(),
-        //         "object_id": object_id.to_string(),
-        //         "object_type": object_type,
-        //         "channel": channel,
-        //         "timestamp": crate::utils::current_timestamp(),
-        //     });
-        //     if let Err(e) = self.emit_core("gorc_zone_exited", &zone_exit_core).await {
-        //         warn!("⚠️ Failed to emit core gorc_zone_exited event: {}", e);
-        //     }
-        // }
-        
         Ok(())
     }
 
@@ -541,6 +705,42 @@ impl EventSystem {
         }
     }
 
+
+    /// Routes a client's GORC event whose payload is already encoded in `format` (a
+    /// bitcode client's) to the `on_gorc_client` handlers. The handlers receive it in
+    /// `GorcEvent::data`, with `GorcEvent::format` saying how to decode it.
+    pub async fn emit_gorc_client_payload(
+        &self,
+        client_player_id: crate::PlayerId,
+        target_object_id: GorcObjectId,
+        channel: u8,
+        event_name: &str,
+        payload: &[u8],
+        format: horizon_protocol::Format,
+    ) -> Result<(), EventError> {
+        let gorc_instances = self.gorc_instances.as_ref().ok_or_else(|| {
+            EventError::HandlerExecution("GORC instance manager not available".to_string())
+        })?;
+        let object_type = gorc_instances
+            .get_object_type(target_object_id)
+            .await
+            .ok_or_else(|| EventError::HandlerNotFound(format!("Target object {} not found", target_object_id)))?;
+        let event_key = CompactString::new_inline("gorc_client:") + &object_type + ":" + &channel.to_string() + ":" + event_name;
+        let data = match format {
+            horizon_protocol::Format::Json => serde_json::from_slice::<serde_json::Value>(payload)?,
+            horizon_protocol::Format::Bitcode => serde_json::Value::from(payload.to_vec()),
+        };
+        let client_event = serde_json::json!({
+            "player_id": client_player_id,
+            "object_id": target_object_id.to_string(),
+            "object_type": object_type,
+            "channel": channel,
+            "data": data,
+            "format": format,
+            "timestamp": crate::utils::current_timestamp()
+        });
+        self.emit_event(&event_key, &client_event).await
+    }
 
     /// Broadcasts an event to all connected clients.
     /// 
@@ -736,4 +936,34 @@ impl EventSystem {
             gorc_instance_handlers,
         }
     }
+}/// A payload encoded through serde in `format`.
+fn encode_serde_payload<T: serde::Serialize + ?Sized>(format: Format, event: &T) -> Result<Vec<u8>, EventError> {
+    horizon_protocol::payload::encode_serde(format, event).map_err(|e| EventError::HandlerExecution(e.to_string()))
+}
+
+/// The JSON envelope of a GORC event, exactly as the server has always sent it, plus
+/// `seq` on unreliable events.
+fn json_gorc_event(
+    instance: &crate::gorc::instance::ObjectInstance,
+    event_name: &str,
+    channel: u8,
+    payload: Vec<u8>,
+    timestamp: u64,
+    delivery: Delivery,
+    seq: u16,
+) -> Result<bytes::Bytes, EventError> {
+    let data = serde_json::value::RawValue::from_string(String::from_utf8(payload).map_err(|e| {
+        EventError::HandlerExecution(format!("JSON payload is not UTF-8: {e}"))
+    })?)?;
+    let envelope = json::GorcEvent {
+        event_type: event_name,
+        object_id: instance.object_id.to_string(),
+        object_type: &instance.type_name,
+        channel,
+        player_id: instance.object_id.to_string(),
+        data: &data,
+        timestamp,
+        seq: (delivery == Delivery::Unreliable).then_some(seq),
+    };
+    Ok(bytes::Bytes::from(serde_json::to_vec(&envelope)?))
 }
