@@ -10,6 +10,7 @@ use crate::gorc::channels::{ReplicationPriority, ReplicationLayer};
 use crate::gorc::zones::ZoneManager;
 use crate::gorc::spatial::SpatialPartition;
 use crate::gorc::virtualization::{VirtualizationManager, VirtualizationConfig};
+use crate::gorc::zone_grid::{Reach, ZoneGrid};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -310,6 +311,30 @@ pub struct GorcInstanceManager {
     next_handle: std::sync::atomic::AtomicU32,
     /// Sequence counter per (object, channel), for clients to order unreliable frames.
     sequences: dashmap::DashMap<(GorcObjectId, u8), u16>,
+    /// Objects by where their zones reach: a player's zone sweep visits these
+    /// candidates instead of every object. Follows `object_positions`.
+    object_zones: ZoneGrid<GorcObjectId>,
+    /// Players by position, in every tier: an object's move checks the players
+    /// within its largest radius instead of every player. Follows `player_positions`.
+    player_zones: ZoneGrid<PlayerId>,
+}
+
+/// Where an object's zones reach, from its largest one; `None` without zones.
+fn reach_of_layers(layers: &[ReplicationLayer]) -> Option<Reach> {
+    layers
+        .iter()
+        .map(|layer| layer.radius)
+        .reduce(f64::max)
+        .map(Reach::of_radius)
+}
+
+/// Drops the duplicates of two grid queries pushed one after the other, the second
+/// starting at `second`. Each query alone has none.
+fn dedup_second_query<K: Copy + Eq + std::hash::Hash>(candidates: &mut Vec<K>, second: usize) {
+    if second > 0 && candidates.len() > second {
+        let mut seen = HashSet::with_capacity(candidates.len());
+        candidates.retain(|key| seen.insert(*key));
+    }
 }
 
 impl GorcInstanceManager {
@@ -336,6 +361,8 @@ impl GorcInstanceManager {
             handle_objects: dashmap::DashMap::new(),
             next_handle: std::sync::atomic::AtomicU32::new(1),
             sequences: dashmap::DashMap::new(),
+            object_zones: ZoneGrid::new(),
+            player_zones: ZoneGrid::new(),
         };
 
         // Initialize spatial index with default region in the background
@@ -425,6 +452,11 @@ impl GorcInstanceManager {
         // Update positions (lock-free with DashMap)
         debug!("🔧 REGISTER[{}]: Phase 2 - inserting object_positions (DashMap) with value {:?}", object_id, initial_position);
         self.object_positions.insert(object_id, initial_position);
+        match reach_of_layers(&layers_for_warning) {
+            Some(reach) => self.object_zones.place(object_id, initial_position, reach),
+            // Re-registered without zones: drop the old placement.
+            None => self.object_zones.remove(object_id),
+        }
         debug!("🔧 REGISTER[{}]: Phase 2 - object_positions updated to {:?}", object_id, initial_position);
         
         debug!("🔧 REGISTER[{}]: Phase 2 - acquiring stats write lock", object_id);
@@ -472,6 +504,7 @@ impl GorcInstanceManager {
             
             // Remove from object_positions (lock-free with DashMap)
             self.object_positions.remove(&object_id);
+            self.object_zones.remove(object_id);
 
             {
                 let mut zone_warnings = self.zone_size_warnings.write().await;
@@ -504,6 +537,7 @@ impl GorcInstanceManager {
         // Update object position tracking (lock-free with DashMap)
         debug!("🔧 UPDATE_POSITION[{}]: Writing new position {:?} (old was {:?})", object_id, new_position, old_position);
         self.object_positions.insert(object_id, new_position);
+        self.object_zones.move_to(object_id, new_position);
 
         // Check for virtual zone splits due to object movement
         let virtual_zones_to_split = self.virtualization_manager
@@ -549,18 +583,23 @@ impl GorcInstanceManager {
 
         // Get old position and update to new position
         let old_position = self.player_positions.insert(player_id, new_position);
+        self.player_zones.place(player_id, new_position, Reach::Every);
 
         // The spatial index is NOT updated here: nothing reads it at runtime (only
         // get_objects_in_range, used by tests), and SpatialPartition takes a global
         // write lock per update — 43 of 78 luminal samples waited on it at 700
         // players. Players are still added / removed in add_player / remove_player.
 
+        // Only an object with a zone containing the old or the new position can see a
+        // transition: the zone grid gives those, instead of a sweep of every object
+        // (16 ms per sweep at 55 000 objects, the bulk of a move's cost on preprod).
+        let candidates = self.objects_near(old_position, new_position);
 
-        // Check all objects for zone membership changes (lock-free iteration over DashMap)
-        for entry in self.objects.iter() {
-            let object_id = entry.key();
-            let instance = entry.value();
-            
+        for object_id in &candidates {
+            let Some(instance) = self.objects.get(object_id) else {
+                continue; // unregistered meanwhile
+            };
+
             // CRITICAL: Get object position from DashMap (lock-free, single source of truth)
             let object_position = match self.object_positions.get(object_id) {
                 Some(pos) => *pos,
@@ -616,8 +655,8 @@ impl GorcInstanceManager {
         // is_subscribed() is true — so the mirrored exit was silently skipped and the remote
         // player stayed on screen, frozen, forever.
         //
-        // Done in a second pass: self.objects.iter() above holds DashMap shard guards, and
-        // taking get_mut() on the same shard from inside that loop would deadlock.
+        // Done in a second pass: the loop above holds a DashMap read guard, and taking
+        // get_mut() on the same shard from inside that loop would deadlock.
         for (object_id, channel) in &zone_entries {
             if let Some(mut instance) = self.objects.get_mut(object_id) {
                 instance.add_subscriber(*channel, player_id);
@@ -633,10 +672,37 @@ impl GorcInstanceManager {
         const MOVEMENT_THRESHOLD_SQ: f64 = 25.0; // 5.0 * 5.0
         if old_position.is_none() || 
            old_position.map(|old| old.distance_squared(new_position) > MOVEMENT_THRESHOLD_SQ).unwrap_or(true) {
-            self.recalculate_player_subscriptions(player_id, new_position).await;
+            self.recalculate_player_subscriptions(player_id, new_position, &candidates).await;
         }
-        
+
         (zone_entries, zone_exits)
+    }
+
+    /// Every object with a zone that can contain `old` or `new` (a superset), each once.
+    fn objects_near(&self, old: Option<Vec3>, new: Vec3) -> Vec<GorcObjectId> {
+        let mut candidates = Vec::new();
+        self.object_zones.near(new, &mut candidates);
+        if let Some(old) = old {
+            let from_new = candidates.len();
+            self.object_zones.near(old, &mut candidates);
+            dedup_second_query(&mut candidates, from_new);
+        }
+        candidates
+    }
+
+    /// Every player that can be within the zones of an object of `reach` at `old` or
+    /// `new` (a superset), each once. `None` when `reach` has no tier: the caller then
+    /// checks every player.
+    fn players_near(&self, reach: Reach, old: Vec3, new: Vec3) -> Option<Vec<PlayerId>> {
+        let Reach::Tier(tier) = reach else {
+            return None;
+        };
+        let mut candidates = Vec::new();
+        self.player_zones.near_in_tier(new, tier, &mut candidates);
+        let from_new = candidates.len();
+        self.player_zones.near_in_tier(old, tier, &mut candidates);
+        dedup_second_query(&mut candidates, from_new);
+        Some(candidates)
     }
 
     /// Sets up core event listeners for automatic player position updates
@@ -674,6 +740,7 @@ impl GorcInstanceManager {
         // can find the player and auto-subscribe them to their own object
         {
             self.player_positions.insert(player_id, position);
+            self.player_zones.place(player_id, position, Reach::Every);
         }
         
         {
@@ -753,6 +820,7 @@ impl GorcInstanceManager {
     pub async fn remove_player(&self, player_id: PlayerId) {
         {
             self.player_positions.remove(&player_id);
+            self.player_zones.remove(player_id);
         }
 
         {
@@ -1015,14 +1083,13 @@ impl GorcInstanceManager {
         instance.zone_manager.is_in_zone(player_pos, channel)
     }
 
-    /// Recalculate subscriptions for a player
-    async fn recalculate_player_subscriptions(&self, player_id: PlayerId, player_position: Vec3) {
-        // Collect object IDs from DashMap (lock-free)
-        let object_ids: Vec<GorcObjectId> = 
-            self.object_positions.iter().map(|entry| *entry.key()).collect();
-
+    /// Recalculate a player's subscriptions to `candidates`: the objects whose zones can
+    /// contain its old or new position, i.e. every subscription this move can change.
+    /// It used to visit every object, taking each one's write lock (70 ms per call at
+    /// 55 000 objects).
+    async fn recalculate_player_subscriptions(&self, player_id: PlayerId, player_position: Vec3, candidates: &[GorcObjectId]) {
         // Use DashMap get_mut for lock-free mutable access
-        for object_id in object_ids {
+        for &object_id in candidates {
             if let Some(mut instance) = self.objects.get_mut(&object_id) {
                 for channel in 0..4 {
                     let should_sub = instance.zone_manager.is_in_zone(player_position, channel);
@@ -1055,10 +1122,22 @@ impl GorcInstanceManager {
     ) -> Vec<(PlayerId, u8, bool)> {
         let mut zone_changes = Vec::new();
 
-        let player_positions: Vec<(PlayerId, Vec3)> = self.player_positions
-            .iter()
-            .map(|entry| (*entry.key(), *entry.value()))
-            .collect();
+        // Only a player within the object's largest radius of its old or new position
+        // can see a transition: the zone grid gives those instead of every player.
+        let nearby = match self.object_zones.reach_of(object_id) {
+            None => Some(Vec::new()), // no zones, or unregistered
+            Some(reach) => self.players_near(reach, old_position, new_position),
+        };
+        let player_positions: Vec<(PlayerId, Vec3)> = match nearby {
+            Some(players) => players
+                .into_iter()
+                .filter_map(|player| self.player_positions.get(&player).map(|pos| (player, *pos)))
+                .collect(),
+            None => self.player_positions
+                .iter()
+                .map(|entry| (*entry.key(), *entry.value()))
+                .collect(),
+        };
 
         // Use DashMap get_mut for lock-free mutable access
         if let Some(mut instance) = self.objects.get_mut(&object_id) {
