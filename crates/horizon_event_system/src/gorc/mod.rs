@@ -52,6 +52,7 @@ pub mod subscription;
 pub mod multicast;
 pub mod spatial;
 pub mod virtualization;
+pub mod zone_grid;
 pub mod config;
 pub mod system;
 

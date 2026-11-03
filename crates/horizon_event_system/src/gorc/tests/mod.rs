@@ -31,3 +31,6 @@ pub mod realistic_movement_test;
 
 #[cfg(test)]
 pub mod format_test;
+
+#[cfg(test)]
+pub mod zone_grid_test;
